@@ -1,4 +1,4 @@
-"""Melshape — Tela de login (paciente e profissional)."""
+"""Melshape — Tela de login com link de recuperação de senha."""
 import streamlit as st
 from core.security import validate_email
 
@@ -13,7 +13,7 @@ def render(services: dict) -> None:
 
         c1, c2 = st.columns(2)
         with c1:
-            submit = st.form_submit_button("Entrar →", type="primary", use_container_width=True)
+            submit  = st.form_submit_button("Entrar →", type="primary", use_container_width=True)
         with c2:
             pro_btn = st.form_submit_button("Sou Profissional", use_container_width=True)
 
@@ -24,7 +24,6 @@ def render(services: dict) -> None:
             elif not password:
                 st.error("Informe a senha.")
             else:
-                # Tenta como paciente
                 user = db.get_user(email, password)
                 if user:
                     st.session_state.user = user.to_dict()
@@ -33,7 +32,6 @@ def render(services: dict) -> None:
                     )
                     st.rerun()
                 else:
-                    # Tenta como profissional
                     pro = db.get_professional(email, password)
                     if pro:
                         st.session_state.professional = pro.to_dict()
@@ -44,4 +42,16 @@ def render(services: dict) -> None:
 
         if pro_btn:
             st.session_state.page = "register_pro"
+            st.rerun()
+
+    # Link de recuperação fora do form
+    st.markdown("")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        if st.button("🔒 Esqueci minha senha", use_container_width=True):
+            st.session_state.page = "forgot_password"
+            st.rerun()
+    with col_r:
+        if st.button("📝 Criar conta grátis", use_container_width=True):
+            st.session_state.page = "register"
             st.rerun()

@@ -1,16 +1,16 @@
-"""Melshape — Cadastro de paciente e profissional."""
+"""Melshape — Cadastro de paciente e profissional com email de boas-vindas."""
 import streamlit as st
 from core.security import lgpd_consent_text, record_lgpd_consent
 from utils.validators import validate_registration
+from services.email_service import send_welcome
+import config
 
 
 def render(services: dict) -> None:
     db     = services["db"]
     is_pro = st.session_state.get("page") == "register_pro"
-
-    label = "🏥 Profissional de Saúde" if is_pro else "👤 Paciente"
+    label  = "🏥 Profissional de Saúde" if is_pro else "👤 Paciente"
     st.markdown(f"#### 📝 Criar conta — {label}")
-
     if is_pro:
         _pro_form(db)
     else:
@@ -25,7 +25,7 @@ def _patient_form(db) -> None:
             email    = st.text_input("Email", placeholder="seu@email.com")
             gender   = st.selectbox(
                 "Gênero", ["female", "male", "other"],
-                format_func=lambda x: {"female": "Feminino", "male": "Masculino", "other": "Outro"}[x],
+                format_func=lambda x: {"female":"Feminino","male":"Masculino","other":"Outro"}[x],
             )
         with c2:
             password  = st.text_input("Senha (mín. 6 caracteres)", type="password")
@@ -43,12 +43,18 @@ def _patient_form(db) -> None:
                 for e in errors:
                     st.error(e)
                 return
+
             lgpd_ts = record_lgpd_consent(email)
             if db.create_user(email, password, name, lgpd_ts=lgpd_ts, gender=gender):
                 user = db.get_user(email, password)
                 if user:
                     st.session_state.user = user.to_dict()
                     st.session_state.page = "onboarding"
+                    # Envia email de boas-vindas em background (não bloqueia a UI)
+                    try:
+                        send_welcome(email, name, config.TRIAL_DAYS)
+                    except Exception:
+                        pass  # Email falhou mas cadastro ok
                     st.success("✅ Conta criada! Trial de 10 dias iniciado.")
                     st.rerun()
             else:
@@ -63,7 +69,7 @@ def _pro_form(db) -> None:
             email     = st.text_input("Email profissional")
             specialty = st.selectbox(
                 "Especialidade",
-                ["nutritionist", "endocrinologist", "other"],
+                ["nutritionist","endocrinologist","other"],
                 format_func=lambda x: {
                     "nutritionist":    "🥗 Nutricionista",
                     "endocrinologist": "🩺 Endocrinologista",
@@ -90,6 +96,10 @@ def _pro_form(db) -> None:
                 if pro:
                     st.session_state.professional = pro.to_dict()
                     st.session_state.page = "pro_dashboard"
+                    try:
+                        send_welcome(email, name, config.TRIAL_DAYS)
+                    except Exception:
+                        pass
                     st.success("✅ Conta profissional criada!")
                     st.rerun()
             else:
