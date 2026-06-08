@@ -1,6 +1,7 @@
 """
 Melshape v2.0 — Entry point principal.
-Roteamento, inicialização de serviços e gestão de sessão.
+Inclui: recuperação de senha via URL, notificações agendadas,
+        cache de serviços e gestão completa de sessão.
 """
 import logging
 import streamlit as st
@@ -17,6 +18,7 @@ from services.professional_service import ProfessionalService
 from views.auth import landing as landing_view
 from views.auth import login as login_view
 from views.auth import register as register_view
+from views.auth import forgot_password as forgot_password_view
 from views.shared import sidebar as sidebar_view
 from views.patient import (
     onboarding as onboarding_view,
@@ -49,17 +51,18 @@ st.set_page_config(
     },
 )
 
-
 # ── Sessão ────────────────────────────────────────────────────────────────────
 _SESSION_DEFAULTS = {
-    "user":                  None,
-    "professional":          None,
-    "page":                  "landing",
-    "demo_loaded":           False,
-    "onboarding_step":       1,
-    "onboarding_mode":       "general",
-    "pro_page":              "pro_patients",
-    "pro_selected_patient":  None,
+    "user":                 None,
+    "professional":         None,
+    "page":                 "landing",
+    "demo_loaded":          False,
+    "onboarding_step":      1,
+    "onboarding_mode":      "general",
+    "pro_page":             "pro_patients",
+    "pro_selected_patient": None,
+    "reset_email_sent":     False,
+    "confirm_delete":       False,
 }
 
 
@@ -70,9 +73,10 @@ def _init_session() -> None:
 
 
 def _clear_session() -> None:
-    """Limpa sessão no logout."""
-    for key in _SESSION_DEFAULTS:
+    """Limpa toda a sessão no logout."""
+    for key in list(_SESSION_DEFAULTS.keys()):
         st.session_state.pop(key, None)
+    st.query_params.clear()
     st.session_state.page = "landing"
     st.rerun()
 
@@ -86,7 +90,7 @@ def _load_css() -> None:
         logger.warning("assets/style.css não encontrado.")
 
 
-# ── Serviços (cache) ──────────────────────────────────────────────────────────
+# ── Serviços (cache global — roda uma vez por sessão de servidor) ─────────────
 @st.cache_resource(show_spinner=False)
 def _init_services() -> dict:
     logger.info("🚀 Inicializando serviços Melshape v2...")
@@ -102,7 +106,7 @@ def _init_services() -> dict:
     except Exception:
         pass
 
-    return {
+    services = {
         "db":           db,
         "nutrition":    NutritionService(db),
         "gamification": GamificationService(db),
@@ -111,8 +115,17 @@ def _init_services() -> dict:
         "professional": ProfessionalService(db),
     }
 
+    # Inicia agendador de notificações em background
+    try:
+        from services.notification_service import schedule_daily_reminders
+        schedule_daily_reminders(db)
+    except Exception as e:
+        logger.warning(f"Agendador não iniciado: {e}")
 
-# ── Demo data ─────────────────────────────────────────────────────────────────
+    return services
+
+
+# ── Dados demo ────────────────────────────────────────────────────────────────
 def _load_demo_data(services: dict) -> None:
     if st.session_state.get("demo_loaded"):
         return
@@ -128,25 +141,27 @@ def _load_demo_data(services: dict) -> None:
     from core.models import Meal, WeightLog, Supplement, WorkoutLog, HydrationLog, SleepLog
 
     demo_meals = [
-        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,"f":7,"fi":0,"t":"12:30","d":0,"tipo":"almoco"},
-        {"food":"Arroz Integral Cozido","cal":248,"p":5.6,"c":52,"f":1.6,"fi":3.4,"t":"12:35","d":0,"tipo":"almoco"},
-        {"food":"Feijão Preto Cozido","cal":154,"p":9,"c":28,"f":1,"fi":12.6,"t":"12:40","d":0,"tipo":"almoco"},
-        {"food":"Café com Leite","cal":120,"p":6,"c":12,"f":4,"fi":0,"t":"07:30","d":0,"tipo":"cafe_manha"},
-        {"food":"Proteína Whey","cal":120,"p":24,"c":3,"f":2,"fi":0,"t":"18:00","d":0,"tipo":"pre_pos_treino"},
-        {"food":"Banana Prata","cal":98,"p":1.3,"c":26,"f":0.1,"fi":2,"t":"15:30","d":1,"tipo":"lanche"},
-        {"food":"Aveia em Flocos","cal":360,"p":13,"c":64,"f":6.9,"fi":9.4,"t":"08:00","d":1,"tipo":"cafe_manha"},
-        {"food":"Tilápia Assada","cal":256,"p":52,"c":0,"f":5.4,"fi":0,"t":"12:30","d":1,"tipo":"almoco"},
-        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,"f":7,"fi":0,"t":"13:00","d":2,"tipo":"almoco"},
-        {"food":"Iogurte Grego","cal":115,"p":8.5,"c":4,"f":6.5,"fi":0,"t":"08:10","d":2,"tipo":"cafe_manha"},
-        {"food":"PF: Arroz+Feijão+Frango","cal":520,"p":38,"c":64,"f":8,"fi":6,"t":"12:30","d":3,"tipo":"almoco"},
-        {"food":"Proteína Whey","cal":120,"p":24,"c":3,"f":2,"fi":0,"t":"18:00","d":3,"tipo":"pre_pos_treino"},
-        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,"f":7,"fi":0,"t":"12:30","d":4,"tipo":"almoco"},
-        {"food":"Arroz Branco Cozido","cal":256,"p":5,"c":56,"f":0.4,"fi":0.4,"t":"12:35","d":4,"tipo":"almoco"},
-        {"food":"Café com Leite","cal":120,"p":6,"c":12,"f":4,"fi":0,"t":"07:30","d":5,"tipo":"cafe_manha"},
-        {"food":"PF: Arroz+Feijão+Frango","cal":520,"p":38,"c":64,"f":8,"fi":6,"t":"13:00","d":5,"tipo":"almoco"},
-        {"food":"Aveia em Flocos","cal":360,"p":13,"c":64,"f":6.9,"fi":9.4,"t":"08:00","d":6,"tipo":"cafe_manha"},
-        {"food":"Tilápia Assada","cal":256,"p":52,"c":0,"f":5.4,"fi":0,"t":"12:30","d":6,"tipo":"almoco"},
+        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,  "f":7,  "fi":0,   "t":"12:30","d":0,"tipo":"almoco"},
+        {"food":"Arroz Integral Cozido",   "cal":248,"p":5.6,"c":52,"f":1.6,"fi":3.4, "t":"12:35","d":0,"tipo":"almoco"},
+        {"food":"Feijão Preto Cozido",     "cal":154,"p":9,  "c":28,"f":1,  "fi":12.6,"t":"12:40","d":0,"tipo":"almoco"},
+        {"food":"Café com Leite",          "cal":120,"p":6,  "c":12,"f":4,  "fi":0,   "t":"07:30","d":0,"tipo":"cafe_manha"},
+        {"food":"Proteína Whey",           "cal":120,"p":24, "c":3, "f":2,  "fi":0,   "t":"18:00","d":0,"tipo":"pre_pos_treino"},
+        {"food":"Banana Prata",            "cal":98, "p":1.3,"c":26,"f":0.1,"fi":2,   "t":"15:30","d":1,"tipo":"lanche"},
+        {"food":"Aveia em Flocos",         "cal":360,"p":13, "c":64,"f":6.9,"fi":9.4, "t":"08:00","d":1,"tipo":"cafe_manha"},
+        {"food":"Tilápia Assada",          "cal":256,"p":52, "c":0, "f":5.4,"fi":0,   "t":"12:30","d":1,"tipo":"almoco"},
+        {"food":"Proteína Whey",           "cal":120,"p":24, "c":3, "f":2,  "fi":0,   "t":"18:00","d":1,"tipo":"pre_pos_treino"},
+        {"food":"Iogurte Grego",           "cal":115,"p":8.5,"c":4, "f":6.5,"fi":0,   "t":"08:10","d":2,"tipo":"cafe_manha"},
+        {"food":"Peito de Frango Grelhado","cal":318,"p":64, "c":0, "f":7,  "fi":0,   "t":"13:00","d":2,"tipo":"almoco"},
+        {"food":"PF: Arroz+Feijão+Frango", "cal":520,"p":38, "c":64,"f":8,  "fi":6,   "t":"12:30","d":3,"tipo":"almoco"},
+        {"food":"Proteína Whey",           "cal":120,"p":24, "c":3, "f":2,  "fi":0,   "t":"18:00","d":3,"tipo":"pre_pos_treino"},
+        {"food":"Peito de Frango Grelhado","cal":318,"p":64, "c":0, "f":7,  "fi":0,   "t":"12:30","d":4,"tipo":"almoco"},
+        {"food":"Arroz Branco Cozido",     "cal":256,"p":5,  "c":56,"f":0.4,"fi":0.4, "t":"12:35","d":4,"tipo":"almoco"},
+        {"food":"Café com Leite",          "cal":120,"p":6,  "c":12,"f":4,  "fi":0,   "t":"07:30","d":5,"tipo":"cafe_manha"},
+        {"food":"PF: Arroz+Feijão+Frango", "cal":520,"p":38, "c":64,"f":8,  "fi":6,   "t":"13:00","d":5,"tipo":"almoco"},
+        {"food":"Aveia em Flocos",         "cal":360,"p":13, "c":64,"f":6.9,"fi":9.4, "t":"08:00","d":6,"tipo":"cafe_manha"},
+        {"food":"Tilápia Assada",          "cal":256,"p":52, "c":0, "f":5.4,"fi":0,   "t":"12:30","d":6,"tipo":"almoco"},
     ]
+
     for m in demo_meals:
         db.save_meal(Meal(
             food=m["food"], calories=m["cal"], protein=m["p"],
@@ -156,10 +171,10 @@ def _load_demo_data(services: dict) -> None:
         ))
 
     for i in range(56):
-        day    = date.today() - timedelta(days=55 - i)
-        weight = round(82.0 - (i * 0.14), 1)
+        day = date.today() - timedelta(days=55 - i)
         db.save_weight(WeightLog(
-            weight=weight, log_date=day.isoformat(),
+            weight=round(82.0 - (i * 0.14), 1),
+            log_date=day.isoformat(),
             notes="Início" if i == 0 else "",
         ))
 
@@ -167,20 +182,17 @@ def _load_demo_data(services: dict) -> None:
                                    category="protein", time_taken="18:00"))
     db.save_supplement(Supplement(name="Vitamina D3", dose="2000", unit="UI",
                                    category="vitamin", time_taken="08:00"))
-
     db.save_workout(WorkoutLog(
         workout_type="strength", muscle_group="legs",
         intensity="heavy", duration_min=60,
     ))
-
     db.save_hydration(HydrationLog(amount_ml=500, log_time="08:00"))
     db.save_hydration(HydrationLog(amount_ml=300, log_time="12:00"))
     db.save_hydration(HydrationLog(amount_ml=400, log_time="16:00"))
-
     db.save_sleep(SleepLog(hours=7.5, quality=4))
 
     st.session_state.demo_loaded = True
-    logger.info("✅ Dados demo v2 carregados!")
+    logger.info("✅ Dados demo carregados!")
 
 
 # ── Roteamento ────────────────────────────────────────────────────────────────
@@ -195,10 +207,14 @@ PATIENT_ROUTES = {
     "profile":     profile_view,
 }
 
-PRO_ROUTES = {
-    "pro_dashboard":       pro_dashboard_view,
-    "pro_patient_detail":  patient_detail_view,
-}
+
+def _check_url_reset_token() -> bool:
+    """
+    Verifica se a URL contém token de reset de senha.
+    Retorna True se deve mostrar tela de redefinição.
+    """
+    params = st.query_params
+    return "reset_token" in params and "email" in params
 
 
 def main() -> None:
@@ -206,6 +222,11 @@ def main() -> None:
         _init_session()
         _load_css()
         services = _init_services()
+
+        # ── RECUPERAÇÃO DE SENHA VIA URL ──────────────────────────────────
+        if _check_url_reset_token():
+            forgot_password_view.render(services)
+            return
 
         # ── VITRINE ───────────────────────────────────────────────────────
         if st.session_state.page == "showcase":
@@ -216,7 +237,6 @@ def main() -> None:
         if st.session_state.professional:
             pro  = st.session_state.professional
             page = st.session_state.page
-
             if page == "pro_patient_detail":
                 patient_detail_view.render(services, pro)
             else:
@@ -226,7 +246,11 @@ def main() -> None:
         # ── NÃO AUTENTICADO ───────────────────────────────────────────────
         user = st.session_state.user
         if not user:
-            landing_view.render(services)
+            page = st.session_state.page
+            if page == "forgot_password":
+                forgot_password_view.render(services)
+            else:
+                landing_view.render(services)
             return
 
         # ── DEMO ──────────────────────────────────────────────────────────
@@ -239,10 +263,13 @@ def main() -> None:
             onboarding_view.render(services, user)
             return
 
-        # ── REDIRECIONA AUTH PAGES → HOME ─────────────────────────────────
-        if page in ("landing", "login", "register", "register_pro"):
+        # ── REDIRECIONA AUTH → HOME ───────────────────────────────────────
+        if page in ("landing", "login", "register", "register_pro", "forgot_password"):
             st.session_state.page = "home"
             st.rerun()
+
+        # ── PREFERÊNCIAS DE NOTIFICAÇÃO NO PERFIL ─────────────────────────
+        # (verificação de trial expirando via banner na sidebar)
 
         # ── SIDEBAR + CONTEÚDO ────────────────────────────────────────────
         sidebar_view.render(services)
@@ -259,7 +286,7 @@ def main() -> None:
         logger.error(f"Erro crítico em main(): {e}", exc_info=True)
         st.error(
             "⚠️ Ocorreu um erro inesperado. Por favor, recarregue a página. "
-            "Se o problema persistir, entre em contato com o suporte."
+            "Se o problema persistir, entre em contato: suporte@melshape.com.br"
         )
         if st.button("🔄 Recarregar"):
             st.rerun()
