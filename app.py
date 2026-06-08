@@ -1,183 +1,269 @@
-# app.py
+"""
+Melshape v2.0 — Entry point principal.
+Roteamento, inicialização de serviços e gestão de sessão.
+"""
+import logging
 import streamlit as st
-from datetime import date
-import random
 
-from config import FEATURES, DESAFIOS, CONQUISTAS
-from styles import aplicar_css, get_tema
-from utils import *
-from database import conectar_supabase, criar_usuario, get_usuario, get_ranking
-from avatar_maker import tela_avatar
+import config
+from core.database import Database
+from services.nutrition_service import NutritionService
+from services.gamification_service import GamificationService
+from services.food_service import FoodService
+from services.plan_service import PlanService
+from services.professional_service import ProfessionalService
 
-# -----------------------------------------------------------------------------
-# P�GINAS
-# -----------------------------------------------------------------------------
+# Views
+from views.auth import landing as landing_view
+from views.auth import login as login_view
+from views.auth import register as register_view
+from views.shared import sidebar as sidebar_view
+from views.patient import (
+    onboarding as onboarding_view,
+    home as home_view,
+    dashboard as dashboard_view,
+    meals as meals_view,
+    weight as weight_view,
+    supplements as supplements_view,
+    workout as workout_view,
+    analysis as analysis_view,
+    profile as profile_view,
+)
+from views.professional import dashboard_pro as pro_dashboard_view
+from views.professional import patient_detail as patient_detail_view
+from views.vitrine import showcase as showcase_view
 
-def pagina_login():
-    st.markdown("<h1 style='text-align:center;'>?? EmagreSim</h1>", unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        with st.form("login_form"):
-            email = st.text_input("E-mail", placeholder="seu@email.com")
-            senha = st.text_input("Senha", type="password", placeholder="��������")
-            if st.form_submit_button("Entrar", use_container_width=True):
-                st.success("Login simulado! Use o modo demonstra��o.")
-        
-        st.markdown("---")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("?? Criar conta", use_container_width=True):
-                st.query_params["pagina"] = "avatar"
-                st.rerun()
-        with col_b:
-            if st.button("?? Modo demonstra��o", use_container_width=True):
-                st.session_state["usuario"] = {
-                    "nome": "Adriano", "email": "demo@emagresim.com",
-                    "idade": 39, "altura": 1.75, "peso_atual": 144.0, "peso_meta": 90.0,
-                    "sexo": "M", "avatar": "??"
-                }
-                st.query_params["pagina"] = "dashboard"
-                st.rerun()
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
+logger = logging.getLogger("Melshape")
 
-def pagina_criar_conta():
-    st.markdown("<h1 style='text-align:center;'>?? Criar Conta</h1>", unsafe_allow_html=True)
-    
-    if "avatar_svg" in st.session_state:
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.markdown(f'<div style="display: flex; justify-content: center;">{st.session_state["avatar_svg"]}</div>', unsafe_allow_html=True)
-            if st.button("?? Editar Avatar"):
-                st.query_params["pagina"] = "avatar"
-                st.rerun()
-        with col2:
-            with st.form("form_criar_conta"):
-                nome = st.text_input("Nome completo")
-                email = st.text_input("E-mail")
-                senha = st.text_input("Senha", type="password")
-                
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    idade = st.number_input("Idade", 18, 100, 30)
-                    altura = st.number_input("Altura (m)", 1.40, 2.50, 1.75, 0.01)
-                with col_b:
-                    peso = st.number_input("Peso atual (kg)", 30.0, 300.0, 80.0, 0.1)
-                    meta_peso = st.number_input("Meta de peso (kg)", 40.0, 200.0, 70.0, 0.5)
-                
-                sexo = st.selectbox("Sexo", ["Masculino", "Feminino"])
-                
-                if st.form_submit_button("?? Criar minha conta", use_container_width=True):
-                    if nome and email and senha:
-                        st.session_state["usuario"] = {
-                            "nome": nome, "email": email, "idade": idade,
-                            "altura": altura, "peso_atual": peso, "peso_meta": meta_peso,
-                            "sexo": "M" if sexo == "Masculino" else "F",
-                            "avatar": st.session_state.get("avatar_svg", "??")
-                        }
-                        st.success(f"? Conta criada com sucesso, {nome}!")
-                        st.balloons()
-                        st.query_params["pagina"] = "dashboard"
-                        st.rerun()
-    else:
-        st.info("?? Primeiro, crie seu avatar!")
-        if st.button("Criar Avatar"):
-            st.query_params["pagina"] = "avatar"
-            st.rerun()
+# ── Configuração da página ────────────────────────────────────────────────────
+st.set_page_config(
+    page_title=f"{config.APP_NAME} — {config.APP_TAGLINE}",
+    page_icon=config.APP_ICON,
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        "About": f"{config.APP_NAME} v{config.APP_VERSION} · {config.APP_TAGLINE}",
+        "Report a bug": "https://melshape.com.br/suporte",
+    },
+)
 
-def pagina_dashboard():
-    usuario = get_usuario()
-    if not usuario:
-        st.warning("Nenhum usu�rio logado")
-        if st.button("Voltar"):
-            st.query_params.clear()
-            st.rerun()
+
+# ── Sessão ────────────────────────────────────────────────────────────────────
+_SESSION_DEFAULTS = {
+    "user":                  None,
+    "professional":          None,
+    "page":                  "landing",
+    "demo_loaded":           False,
+    "onboarding_step":       1,
+    "onboarding_mode":       "general",
+    "pro_page":              "pro_patients",
+    "pro_selected_patient":  None,
+}
+
+
+def _init_session() -> None:
+    for key, val in _SESSION_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+def _clear_session() -> None:
+    """Limpa sessão no logout."""
+    for key in _SESSION_DEFAULTS:
+        st.session_state.pop(key, None)
+    st.session_state.page = "landing"
+    st.rerun()
+
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+def _load_css() -> None:
+    try:
+        with open("assets/style.css", encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    except FileNotFoundError:
+        logger.warning("assets/style.css não encontrado.")
+
+
+# ── Serviços (cache) ──────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _init_services() -> dict:
+    logger.info("🚀 Inicializando serviços Melshape v2...")
+    db = Database()
+
+    supabase_client = None
+    try:
+        if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
+            from supabase import create_client
+            supabase_client = create_client(
+                st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
+            )
+    except Exception:
+        pass
+
+    return {
+        "db":           db,
+        "nutrition":    NutritionService(db),
+        "gamification": GamificationService(db),
+        "foods":        FoodService(supabase_client),
+        "plan":         PlanService(db),
+        "professional": ProfessionalService(db),
+    }
+
+
+# ── Demo data ─────────────────────────────────────────────────────────────────
+def _load_demo_data(services: dict) -> None:
+    if st.session_state.get("demo_loaded"):
         return
-    
-    C = get_tema()
-    
-    # Cabe�alho com avatar
-    col_avatar, col_titulo = st.columns([1, 4])
-    with col_avatar:
-        if usuario.get("avatar") and usuario["avatar"].startswith("<svg"):
-            st.markdown(f'<div style="display: flex; justify-content: center;">{usuario["avatar"]}</div>', unsafe_allow_html=True)
+    u = st.session_state.get("user")
+    if not u or u.get("email") != config.DEMO_EMAIL:
+        return
+    db = services["db"]
+    if len(db.get_meals(30)) > 0:
+        st.session_state.demo_loaded = True
+        return
+
+    from datetime import date, timedelta
+    from core.models import Meal, WeightLog, Supplement, WorkoutLog, HydrationLog, SleepLog
+
+    demo_meals = [
+        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,"f":7,"fi":0,"t":"12:30","d":0,"tipo":"almoco"},
+        {"food":"Arroz Integral Cozido","cal":248,"p":5.6,"c":52,"f":1.6,"fi":3.4,"t":"12:35","d":0,"tipo":"almoco"},
+        {"food":"Feijão Preto Cozido","cal":154,"p":9,"c":28,"f":1,"fi":12.6,"t":"12:40","d":0,"tipo":"almoco"},
+        {"food":"Café com Leite","cal":120,"p":6,"c":12,"f":4,"fi":0,"t":"07:30","d":0,"tipo":"cafe_manha"},
+        {"food":"Proteína Whey","cal":120,"p":24,"c":3,"f":2,"fi":0,"t":"18:00","d":0,"tipo":"pre_pos_treino"},
+        {"food":"Banana Prata","cal":98,"p":1.3,"c":26,"f":0.1,"fi":2,"t":"15:30","d":1,"tipo":"lanche"},
+        {"food":"Aveia em Flocos","cal":360,"p":13,"c":64,"f":6.9,"fi":9.4,"t":"08:00","d":1,"tipo":"cafe_manha"},
+        {"food":"Tilápia Assada","cal":256,"p":52,"c":0,"f":5.4,"fi":0,"t":"12:30","d":1,"tipo":"almoco"},
+        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,"f":7,"fi":0,"t":"13:00","d":2,"tipo":"almoco"},
+        {"food":"Iogurte Grego","cal":115,"p":8.5,"c":4,"f":6.5,"fi":0,"t":"08:10","d":2,"tipo":"cafe_manha"},
+        {"food":"PF: Arroz+Feijão+Frango","cal":520,"p":38,"c":64,"f":8,"fi":6,"t":"12:30","d":3,"tipo":"almoco"},
+        {"food":"Proteína Whey","cal":120,"p":24,"c":3,"f":2,"fi":0,"t":"18:00","d":3,"tipo":"pre_pos_treino"},
+        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,"f":7,"fi":0,"t":"12:30","d":4,"tipo":"almoco"},
+        {"food":"Arroz Branco Cozido","cal":256,"p":5,"c":56,"f":0.4,"fi":0.4,"t":"12:35","d":4,"tipo":"almoco"},
+        {"food":"Café com Leite","cal":120,"p":6,"c":12,"f":4,"fi":0,"t":"07:30","d":5,"tipo":"cafe_manha"},
+        {"food":"PF: Arroz+Feijão+Frango","cal":520,"p":38,"c":64,"f":8,"fi":6,"t":"13:00","d":5,"tipo":"almoco"},
+        {"food":"Aveia em Flocos","cal":360,"p":13,"c":64,"f":6.9,"fi":9.4,"t":"08:00","d":6,"tipo":"cafe_manha"},
+        {"food":"Tilápia Assada","cal":256,"p":52,"c":0,"f":5.4,"fi":0,"t":"12:30","d":6,"tipo":"almoco"},
+    ]
+    for m in demo_meals:
+        db.save_meal(Meal(
+            food=m["food"], calories=m["cal"], protein=m["p"],
+            carbs=m["c"], fat=m["f"], fiber=m["fi"],
+            meal_time=m["t"], meal_type=m["tipo"],
+            meal_date=(date.today() - timedelta(days=m["d"])).isoformat(),
+        ))
+
+    for i in range(56):
+        day    = date.today() - timedelta(days=55 - i)
+        weight = round(82.0 - (i * 0.14), 1)
+        db.save_weight(WeightLog(
+            weight=weight, log_date=day.isoformat(),
+            notes="Início" if i == 0 else "",
+        ))
+
+    db.save_supplement(Supplement(name="Proteína Whey", dose="30", unit="g",
+                                   category="protein", time_taken="18:00"))
+    db.save_supplement(Supplement(name="Vitamina D3", dose="2000", unit="UI",
+                                   category="vitamin", time_taken="08:00"))
+
+    db.save_workout(WorkoutLog(
+        workout_type="strength", muscle_group="legs",
+        intensity="heavy", duration_min=60,
+    ))
+
+    db.save_hydration(HydrationLog(amount_ml=500, log_time="08:00"))
+    db.save_hydration(HydrationLog(amount_ml=300, log_time="12:00"))
+    db.save_hydration(HydrationLog(amount_ml=400, log_time="16:00"))
+
+    db.save_sleep(SleepLog(hours=7.5, quality=4))
+
+    st.session_state.demo_loaded = True
+    logger.info("✅ Dados demo v2 carregados!")
+
+
+# ── Roteamento ────────────────────────────────────────────────────────────────
+PATIENT_ROUTES = {
+    "home":        home_view,
+    "dashboard":   dashboard_view,
+    "meals":       meals_view,
+    "weight":      weight_view,
+    "supplements": supplements_view,
+    "workout":     workout_view,
+    "analysis":    analysis_view,
+    "profile":     profile_view,
+}
+
+PRO_ROUTES = {
+    "pro_dashboard":       pro_dashboard_view,
+    "pro_patient_detail":  patient_detail_view,
+}
+
+
+def main() -> None:
+    try:
+        _init_session()
+        _load_css()
+        services = _init_services()
+
+        # ── VITRINE ───────────────────────────────────────────────────────
+        if st.session_state.page == "showcase":
+            showcase_view.render()
+            return
+
+        # ── PROFISSIONAL ──────────────────────────────────────────────────
+        if st.session_state.professional:
+            pro  = st.session_state.professional
+            page = st.session_state.page
+
+            if page == "pro_patient_detail":
+                patient_detail_view.render(services, pro)
+            else:
+                pro_dashboard_view.render(services, pro)
+            return
+
+        # ── NÃO AUTENTICADO ───────────────────────────────────────────────
+        user = st.session_state.user
+        if not user:
+            landing_view.render(services)
+            return
+
+        # ── DEMO ──────────────────────────────────────────────────────────
+        if user.get("email") == config.DEMO_EMAIL:
+            _load_demo_data(services)
+
+        # ── ONBOARDING ────────────────────────────────────────────────────
+        page = st.session_state.page
+        if not user.get("onboarding_done") or page == "onboarding":
+            onboarding_view.render(services, user)
+            return
+
+        # ── REDIRECIONA AUTH PAGES → HOME ─────────────────────────────────
+        if page in ("landing", "login", "register", "register_pro"):
+            st.session_state.page = "home"
+            st.rerun()
+
+        # ── SIDEBAR + CONTEÚDO ────────────────────────────────────────────
+        sidebar_view.render(services)
+
+        view = PATIENT_ROUTES.get(page)
+        if view:
+            view.render(services, user)
         else:
-            st.markdown(f'<div style="font-size: 3rem; text-align: center;">{usuario.get("avatar", "??")}</div>', unsafe_allow_html=True)
-    with col_titulo:
-        st.markdown(f"<h1>Ol�, {usuario['nome']}!</h1>", unsafe_allow_html=True)
-        st.markdown(f"<p>{mensagem_bom_dia()}</p>", unsafe_allow_html=True)
-    
-    # Mensagem de suporte emocional
-    if FEATURES["enable_mood_support"] and st.button("?? Estou me sentindo para baixo", use_container_width=True):
-        st.info("?? Um dia dif�cil n�o define sua jornada. Que tal uma meta mais leve hoje?")
-        st.session_state["meta_leve"] = True
-    
-    # KPIs
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        imc = calcular_imc(usuario["peso_atual"], usuario["altura"])
-        st.metric("Peso Atual", f"{usuario['peso_atual']:.1f} kg", f"Meta: {usuario['peso_meta']:.0f} kg")
-    with col2:
-        st.metric("IMC", f"{imc:.1f}", classificar_imc(imc))
-    with col3:
-        tmb = calcular_tmb(usuario["peso_atual"], usuario["altura"], usuario["idade"], usuario["sexo"])
-        st.metric("TMB", f"{int(tmb)} kcal", "Basal")
-    with col4:
-        st.metric("Plano", "Gr�tis")
-    
-    # Gr�fico de evolu��o
-    st.markdown("### ?? Evolu��o do Peso")
-    fig = gerar_grafico_peso([], usuario["peso_meta"])
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Previs�o
-    data_meta = previsao_meta(usuario["peso_atual"], usuario["peso_meta"])
-    if data_meta:
-        st.info(f"?? **Previs�o:** Mantendo o ritmo, voc� atinge sua meta em **{data_meta.strftime('%d/%m/%Y')}**")
-    
-    # Desafio da semana
-    if FEATURES["enable_challenges"]:
-        with st.expander("?? Desafio da Semana", expanded=True):
-            desafio = random.choice(DESAFIOS)
-            st.markdown(f"**{desafio['nome']}** � {desafio['descricao']} ? +{desafio['xp']} XP")
-            st.progress(0.3, text=f"Progresso: {desafio['meta'] * 0.3:.0f}/{desafio['meta']} dias")
-    
-    # Receita do dia
-    if FEATURES["enable_recipe_suggestion"]:
-        with st.expander("?? Receita do dia", expanded=False):
-            receita = receita_do_dia()
-            st.markdown(f"**{receita['nome']}** - {receita['calorias']} kcal")
-    
-    # Ranking
-    ranking = get_ranking()
-    if ranking:
-        st.markdown("### ?? Ranking Semanal")
-        for i, r in enumerate(ranking[:5]):
-            medalha = ["??", "??", "??"][i] if i < 3 else f"{i+1}�"
-            st.write(f"{medalha} **{r['nome']}** � {r['pontos']} pontos")
-    
-    # Bot�o sair
-    if st.button("?? Sair", use_container_width=True):
-        st.session_state.clear()
-        st.query_params.clear()
-        st.rerun()
+            logger.warning(f"Página desconhecida: {page}")
+            st.session_state.page = "home"
+            st.rerun()
 
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
+    except Exception as e:
+        logger.error(f"Erro crítico em main(): {e}", exc_info=True)
+        st.error(
+            "⚠️ Ocorreu um erro inesperado. Por favor, recarregue a página. "
+            "Se o problema persistir, entre em contato com o suporte."
+        )
+        if st.button("🔄 Recarregar"):
+            st.rerun()
 
-def main():
-    aplicar_css()
-    
-    pagina = st.query_params.get("pagina", "login")
-    
-    if pagina == "avatar":
-        tela_avatar()
-    elif pagina == "criar_conta":
-        pagina_criar_conta()
-    elif pagina == "dashboard":
-        pagina_dashboard()
-    else:
-        pagina_login()
 
 if __name__ == "__main__":
     main()
