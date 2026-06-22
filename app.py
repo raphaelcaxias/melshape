@@ -1,9 +1,23 @@
 """
-Melshape v2.0 — Entry point principal.
-Inclui: recuperação de senha via URL, notificações agendadas,
-        cache de serviços e gestão completa de sessão.
+Melshape v3.0 — Entry Point Principal.
+
+Arquitetura limpa, roteamento declarativo, injeção de dependências,
+cache inteligente, tratamento de erros robusto e performance otimizada.
+
+Princípios:
+- Tudo que pode ser cacheado, é cacheado (@st.cache_resource)
+- Tudo que pode ser lazy-loaded, é lazy-loaded
+- Erros são tratados com gracefulness (nunca quebram a UI)
+- Estado é gerenciado centralizadamente (sem variáveis globais)
+- Dark mode persistente no banco
+- Demo data carregado sob demanda
 """
+from __future__ import annotations
+
 import logging
+from datetime import date, timedelta, datetime
+from typing import Any, Callable
+
 import streamlit as st
 
 import config
@@ -13,33 +27,22 @@ from services.gamification_service import GamificationService
 from services.food_service import FoodService
 from services.plan_service import PlanService
 from services.professional_service import ProfessionalService
+from services.journey_service import JourneyService
+from services.orchestrator import Orchestrator
+from services.notification_service import NotificationService
+from services.score_service import ScoreService
+from services.contextualizer import ctx
+from services.relapse_service import RelapseService
 
-# Views
-from views.auth import landing as landing_view
-from views.auth import login as login_view
-from views.auth import register as register_view
-from views.auth import forgot_password as forgot_password_view
-from views.shared import sidebar as sidebar_view
-from views.patient import (
-    onboarding as onboarding_view,
-    home as home_view,
-    dashboard as dashboard_view,
-    meals as meals_view,
-    weight as weight_view,
-    supplements as supplements_view,
-    workout as workout_view,
-    analysis as analysis_view,
-    profile as profile_view,
+# ── LOGGING CONFIGURADO ──────────────────────────────────────────────────────
+logging.basicConfig(
+    level=config.LOG_LEVEL,
+    format=config.LOG_FORMAT,
+    handlers=[logging.StreamHandler()]
 )
-from views.professional import dashboard_pro as pro_dashboard_view
-from views.professional import patient_detail as patient_detail_view
-from views.vitrine import showcase as showcase_view
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
 logger = logging.getLogger("Melshape")
 
-# ── Configuração da página ────────────────────────────────────────────────────
+# ── CONFIGURAÇÃO DA PÁGINA ──────────────────────────────────────────────────
 st.set_page_config(
     page_title=f"{config.APP_NAME} — {config.APP_TAGLINE}",
     page_icon=config.APP_ICON,
@@ -47,250 +50,319 @@ st.set_page_config(
     initial_sidebar_state="expanded",
     menu_items={
         "About": f"{config.APP_NAME} v{config.APP_VERSION} · {config.APP_TAGLINE}",
-        "Report a bug": "https://melshape.com.br/suporte",
+        "Report a bug": config.SUPPORT_EMAIL,
+        "Get help": config.SUPPORT_EMAIL,
     },
 )
 
-# ── Sessão ────────────────────────────────────────────────────────────────────
-_SESSION_DEFAULTS = {
-    "user":                 None,
-    "professional":         None,
-    "page":                 "landing",
-    "demo_loaded":          False,
-    "onboarding_step":      1,
-    "onboarding_mode":      "general",
-    "pro_page":             "pro_patients",
-    "pro_selected_patient": None,
-    "reset_email_sent":     False,
-    "confirm_delete":       False,
-}
-
-
-def _init_session() -> None:
-    for key, val in _SESSION_DEFAULTS.items():
+# ── ESTADO DA SESSÃO ────────────────────────────────────────────────────────
+def _init_session_state() -> None:
+    """
+    Inicializa o estado da sessão de forma segura.
+    Evita o anti-padrão de usar classes customizadas para o st.session_state.
+    """
+    defaults: dict[str, Any] = {
+        "user": None,
+        "professional": None,
+        "page": "landing",
+        "perfil_id": None,
+        "demo_loaded": False,
+        "onboarding_step": 1,
+        "onboarding_mode": "general",
+        "pro_selected_patient": None,
+        "reset_email_sent": False,
+        "hub_tipo": "meal",
+        "ci_result": None,
+        "cs_resumo": None,
+        "dark_mode": False,
+    }
+    
+    for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+            
+    # Mutables precisam de atenção especial para evitar compartilhamento de referência
+    if "desafios_concluidos_local" not in st.session_state:
+        st.session_state["desafios_concluidos_local"] = set()
 
-
-def _clear_session() -> None:
-    """Limpa toda a sessão no logout."""
-    for key in list(_SESSION_DEFAULTS.keys()):
-        st.session_state.pop(key, None)
-    st.query_params.clear()
-    st.session_state.page = "landing"
-    st.rerun()
-
-
-# ── CSS ───────────────────────────────────────────────────────────────────────
-def _load_css() -> None:
-    try:
-        with open("assets/style.css", encoding="utf-8") as f:
-            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
-    except FileNotFoundError:
-        logger.warning("assets/style.css não encontrado.")
-
-
-# ── Serviços (cache global — roda uma vez por sessão de servidor) ─────────────
-@st.cache_resource(show_spinner=False)
-def _init_services() -> dict:
-    logger.info("🚀 Inicializando serviços Melshape v2...")
-    db = Database()
-
-    supabase_client = None
-    try:
-        if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
-            from supabase import create_client
-            supabase_client = create_client(
-                st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
-            )
-    except Exception:
-        pass
-
-    services = {
-        "db":           db,
-        "nutrition":    NutritionService(db),
-        "gamification": GamificationService(db),
-        "foods":        FoodService(supabase_client),
-        "plan":         PlanService(db),
-        "professional": ProfessionalService(db),
+# ── IMPORTS DAS VIEWS (Lazy Loading) ────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=3600)
+def _get_views() -> dict[str, Callable]:
+    """
+    Carrega e cacheia o dicionário de views.
+    O cache_data garante que o dicionário não seja reconstruído a cada rerun.
+    """
+    # Imports locais para evitar circular imports e carregar sob demanda
+    from views.auth import landing, login, register, forgot_password
+    from views.shared import sidebar
+    from views.patient import (
+        home, onboarding, habits, goals, achievements, 
+        glp1, bariatric, checkin, journey_story, profile
+    )
+    from views.patient.complete_evolution import render as evolution_view
+    from views.patient.share_card import render as share_view
+    from views.patient.register_hub import render as register_hub_view
+    from views.patient.journey import render as journey_view
+    from views.professional import dashboard_pro, patient_detail
+    from views.professional.triage_panel import render_triagem
+    from views.professional.executive_dashboard import render as executive_view
+    
+    return {
+        # Auth
+        "landing": landing.render,
+        "login": login.render,
+        "register": register.render,
+        "register_pro": register.render,
+        "forgot_password": forgot_password.render,
+        
+        # Patient
+        "home": home.render,
+        "dashboard": home.render,
+        "onboarding": onboarding.render,
+        "checkin": checkin.render,
+        "meals": register_hub_view,
+        "weight": register_hub_view,
+        "journey": journey_view,
+        "habits": habits.render,
+        "supplements": habits.render,
+        "workout": habits.render,
+        "goals": goals.render,
+        "analysis": achievements.render,
+        "glp1": glp1.render,
+        "bariatric": bariatric.render,
+        "story": journey_story.render,
+        "profile": profile.render,
+        "evolution": evolution_view,
+        "share": share_view,
+        
+        # Professional
+        "pro_dashboard": dashboard_pro.render,
+        "pro_patient_detail": patient_detail.render,
+        "pro_triagem": render_triagem,
+        "pro_executive": executive_view,
+        
+        # Shared
+        "sidebar": sidebar.render,
     }
 
+# ── INICIALIZAÇÃO DOS SERVIÇOS (Cached) ─────────────────────────────────────
+@st.cache_resource(show_spinner=False, ttl=3600)
+def _init_services() -> dict[str, Any]:
+    """
+    Inicializa todos os serviços com cache de recurso.
+    Mantém as instâncias vivas entre os reruns do Streamlit.
+    """
+    logger.info(f"🚀 Inicializando {config.APP_NAME} v{config.APP_VERSION}...")
+    
+    db = Database()
+    supabase_client = db.client if db.is_real else None
+    
+    services = {
+        "db": db,
+        "nutrition": NutritionService(db),
+        "gamification": GamificationService(db),
+        "foods": FoodService(supabase_client),
+        "plan": PlanService(db),
+        "professional": ProfessionalService(db),
+        "journey": JourneyService(db),
+        "orchestrator": Orchestrator(db),
+        "notification": NotificationService(db),
+        "score": ScoreService(db),
+        "contextualizer": ctx,
+        "relapse": RelapseService(db),
+    }
+    
     # Inicia agendador de notificações em background
     try:
         from services.notification_service import schedule_daily_reminders
         schedule_daily_reminders(db)
+        logger.info("✅ Agendador de notificações iniciado")
     except Exception as e:
-        logger.warning(f"Agendador não iniciado: {e}")
-
+        logger.warning(f"⚠️ Agendador não iniciado: {e}")
+    
     return services
 
-
-# ── Dados demo ────────────────────────────────────────────────────────────────
-def _load_demo_data(services: dict) -> None:
-    if st.session_state.get("demo_loaded"):
-        return
-    u = st.session_state.get("user")
-    if not u or u.get("email") != config.DEMO_EMAIL:
-        return
-    db = services["db"]
-    if len(db.get_meals(30)) > 0:
-        st.session_state.demo_loaded = True
-        return
-
-    from datetime import date, timedelta
-    from core.models import Meal, WeightLog, Supplement, WorkoutLog, HydrationLog, SleepLog
-
-    demo_meals = [
-        {"food":"Peito de Frango Grelhado","cal":318,"p":64,"c":0,  "f":7,  "fi":0,   "t":"12:30","d":0,"tipo":"almoco"},
-        {"food":"Arroz Integral Cozido",   "cal":248,"p":5.6,"c":52,"f":1.6,"fi":3.4, "t":"12:35","d":0,"tipo":"almoco"},
-        {"food":"Feijão Preto Cozido",     "cal":154,"p":9,  "c":28,"f":1,  "fi":12.6,"t":"12:40","d":0,"tipo":"almoco"},
-        {"food":"Café com Leite",          "cal":120,"p":6,  "c":12,"f":4,  "fi":0,   "t":"07:30","d":0,"tipo":"cafe_manha"},
-        {"food":"Proteína Whey",           "cal":120,"p":24, "c":3, "f":2,  "fi":0,   "t":"18:00","d":0,"tipo":"pre_pos_treino"},
-        {"food":"Banana Prata",            "cal":98, "p":1.3,"c":26,"f":0.1,"fi":2,   "t":"15:30","d":1,"tipo":"lanche"},
-        {"food":"Aveia em Flocos",         "cal":360,"p":13, "c":64,"f":6.9,"fi":9.4, "t":"08:00","d":1,"tipo":"cafe_manha"},
-        {"food":"Tilápia Assada",          "cal":256,"p":52, "c":0, "f":5.4,"fi":0,   "t":"12:30","d":1,"tipo":"almoco"},
-        {"food":"Proteína Whey",           "cal":120,"p":24, "c":3, "f":2,  "fi":0,   "t":"18:00","d":1,"tipo":"pre_pos_treino"},
-        {"food":"Iogurte Grego",           "cal":115,"p":8.5,"c":4, "f":6.5,"fi":0,   "t":"08:10","d":2,"tipo":"cafe_manha"},
-        {"food":"Peito de Frango Grelhado","cal":318,"p":64, "c":0, "f":7,  "fi":0,   "t":"13:00","d":2,"tipo":"almoco"},
-        {"food":"PF: Arroz+Feijão+Frango", "cal":520,"p":38, "c":64,"f":8,  "fi":6,   "t":"12:30","d":3,"tipo":"almoco"},
-        {"food":"Proteína Whey",           "cal":120,"p":24, "c":3, "f":2,  "fi":0,   "t":"18:00","d":3,"tipo":"pre_pos_treino"},
-        {"food":"Peito de Frango Grelhado","cal":318,"p":64, "c":0, "f":7,  "fi":0,   "t":"12:30","d":4,"tipo":"almoco"},
-        {"food":"Arroz Branco Cozido",     "cal":256,"p":5,  "c":56,"f":0.4,"fi":0.4, "t":"12:35","d":4,"tipo":"almoco"},
-        {"food":"Café com Leite",          "cal":120,"p":6,  "c":12,"f":4,  "fi":0,   "t":"07:30","d":5,"tipo":"cafe_manha"},
-        {"food":"PF: Arroz+Feijão+Frango", "cal":520,"p":38, "c":64,"f":8,  "fi":6,   "t":"13:00","d":5,"tipo":"almoco"},
-        {"food":"Aveia em Flocos",         "cal":360,"p":13, "c":64,"f":6.9,"fi":9.4, "t":"08:00","d":6,"tipo":"cafe_manha"},
-        {"food":"Tilápia Assada",          "cal":256,"p":52, "c":0, "f":5.4,"fi":0,   "t":"12:30","d":6,"tipo":"almoco"},
-    ]
-
-    for m in demo_meals:
-        db.save_meal(Meal(
-            food=m["food"], calories=m["cal"], protein=m["p"],
-            carbs=m["c"], fat=m["f"], fiber=m["fi"],
-            meal_time=m["t"], meal_type=m["tipo"],
-            meal_date=(date.today() - timedelta(days=m["d"])).isoformat(),
-        ))
-
-    for i in range(56):
-        day = date.today() - timedelta(days=55 - i)
-        db.save_weight(WeightLog(
-            weight=round(82.0 - (i * 0.14), 1),
-            log_date=day.isoformat(),
-            notes="Início" if i == 0 else "",
-        ))
-
-    db.save_supplement(Supplement(name="Proteína Whey", dose="30", unit="g",
-                                   category="protein", time_taken="18:00"))
-    db.save_supplement(Supplement(name="Vitamina D3", dose="2000", unit="UI",
-                                   category="vitamin", time_taken="08:00"))
-    db.save_workout(WorkoutLog(
-        workout_type="strength", muscle_group="legs",
-        intensity="heavy", duration_min=60,
-    ))
-    db.save_hydration(HydrationLog(amount_ml=500, log_time="08:00"))
-    db.save_hydration(HydrationLog(amount_ml=300, log_time="12:00"))
-    db.save_hydration(HydrationLog(amount_ml=400, log_time="16:00"))
-    db.save_sleep(SleepLog(hours=7.5, quality=4))
-
-    st.session_state.demo_loaded = True
-    logger.info("✅ Dados demo carregados!")
-
-
-# ── Roteamento ────────────────────────────────────────────────────────────────
-PATIENT_ROUTES = {
-    "home":        home_view,
-    "dashboard":   dashboard_view,
-    "meals":       meals_view,
-    "weight":      weight_view,
-    "supplements": supplements_view,
-    "workout":     workout_view,
-    "analysis":    analysis_view,
-    "profile":     profile_view,
-}
-
-
-def _check_url_reset_token() -> bool:
-    """
-    Verifica se a URL contém token de reset de senha.
-    Retorna True se deve mostrar tela de redefinição.
-    """
-    params = st.query_params
-    return "reset_token" in params and "email" in params
-
-
-def main() -> None:
+# ── LOADER DE CSS E TEMA ────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_css() -> str:
+    """Carrega CSS do arquivo com cache."""
     try:
-        _init_session()
-        _load_css()
-        services = _init_services()
+        with open("assets/style.css", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.warning("assets/style.css não encontrado.")
+        return ""
 
-        # ── RECUPERAÇÃO DE SENHA VIA URL ──────────────────────────────────
-        if _check_url_reset_token():
-            forgot_password_view.render(services)
+def _apply_theme(dark_mode: bool) -> None:
+    """Aplica o tema (claro/escuro) via JavaScript."""
+    theme = "dark" if dark_mode else "light"
+    st.markdown(
+        f'<script>document.documentElement.setAttribute("data-theme","{theme}")</script>',
+        unsafe_allow_html=True,
+    )
+
+# ── DEMO DATA ────────────────────────────────────────────────────────────────
+def _load_demo_data(services: dict[str, Any]) -> None:
+    """Carrega dados demo para o usuário demo (executado apenas uma vez)."""
+    if st.session_state.demo_loaded:
+        return
+    
+    user = st.session_state.user
+    if not user or user.get("email") != config.DEMO_EMAIL:
+        return
+    
+    db = services["db"]
+    try:
+        # Verificação rápida para não inserir dados duplicados
+        if len(db.get_meals(30)) > 0:
+            st.session_state.demo_loaded = True
             return
+        
+        from core.models import Meal, WeightLog
+        
+        demo_meals = [
+            ("Peito de Frango Grelhado", 318, 64, 0, 7, 0, "12:30", 0, "almoco"),
+            ("Arroz Integral Cozido", 248, 5.6, 52, 1.6, 3.4, "12:35", 0, "almoco"),
+            ("Café com Leite", 120, 6, 12, 4, 0, "07:30", 0, "cafe_manha"),
+            ("Proteína Whey", 120, 24, 3, 2, 0, "18:00", 0, "pre_pos_treino"),
+            ("Banana Prata", 98, 1.3, 26, 0.1, 2, "15:30", 1, "lanche"),
+            ("Tilápia Assada", 256, 52, 0, 5.4, 0, "12:30", 1, "almoco"),
+            ("Aveia em Flocos", 360, 13, 64, 6.9, 9.4, "08:00", 2, "cafe_manha"),
+        ]
+        
+        for food, cal, p, c, f, fi, t, d, tipo in demo_meals:
+            db.save_meal(Meal(
+                food=food, calories=cal, protein=p, carbs=c,
+                fat=f, fiber=fi, meal_time=t, meal_type=tipo,
+                meal_date=(date.today() - timedelta(days=d)).isoformat(),
+            ))
+        
+        for i in range(30):
+            db.save_weight(WeightLog(
+                weight=round(82.0 - i * 0.14, 1),
+                log_date=(date.today() - timedelta(days=29 - i)).isoformat(),
+            ))
+        
+        st.session_state.demo_loaded = True
+        logger.info("✅ Demo data carregado com sucesso")
+    except Exception as e:
+        logger.warning(f"Erro ao carregar demo data: {e}")
 
-        # ── VITRINE ───────────────────────────────────────────────────────
-        if st.session_state.page == "showcase":
-            showcase_view.render()
+# ── ROTEADOR PRINCIPAL ──────────────────────────────────────────────────────
+def _route(services: dict[str, Any]) -> None:
+    """
+    Roteamento principal com tratamento de erros e fluxo linear.
+    """
+    views = _get_views()
+    page: str = st.session_state.page
+    user: dict | None = st.session_state.user
+    professional: dict | None = st.session_state.professional
+    
+    try:
+        # 1. RESET DE SENHA VIA URL (Prioridade máxima)
+        if "reset_token" in st.query_params and "email" in st.query_params:
+            views["forgot_password"](services)
             return
-
-        # ── PROFISSIONAL ──────────────────────────────────────────────────
-        if st.session_state.professional:
-            pro  = st.session_state.professional
-            page = st.session_state.page
+        
+        # 2. FLUXO DO PROFISSIONAL
+        if professional:
+            pro_pages = {"pro_patient_detail", "pro_triagem", "pro_executive"}
+            target_view = views[page] if page in pro_pages else views["pro_dashboard"]
+            
             if page == "pro_patient_detail":
-                patient_detail_view.render(services, pro)
+                target_view(services, professional)
             else:
-                pro_dashboard_view.render(services, pro)
+                target_view(services) if page in {"pro_triagem", "pro_executive"} else target_view(services, professional)
             return
-
-        # ── NÃO AUTENTICADO ───────────────────────────────────────────────
-        user = st.session_state.user
+        
+        # 3. FLUXO NÃO AUTENTICADO
         if not user:
-            page = st.session_state.page
-            if page == "forgot_password":
-                forgot_password_view.render(services)
-            else:
-                landing_view.render(services)
+            auth_pages = {"landing", "login", "register", "register_pro", "forgot_password"}
+            target_page = page if page in auth_pages else "landing"
+            views[target_page](services)
             return
-
-        # ── DEMO ──────────────────────────────────────────────────────────
+        
+        # 4. FLUXO DO PACIENTE AUTENTICADO
         if user.get("email") == config.DEMO_EMAIL:
             _load_demo_data(services)
-
-        # ── ONBOARDING ────────────────────────────────────────────────────
-        page = st.session_state.page
+        
+        # Onboarding obrigatório
         if not user.get("onboarding_done") or page == "onboarding":
-            onboarding_view.render(services, user)
+            views["onboarding"](services, user)
+            # Se acabou de completar o onboarding durante este rerun
+            if st.session_state.get("user", {}).get("onboarding_done"):
+                services["notification"].configurar_lembretes_iniciais(user)
             return
-
-        # ── REDIRECIONA AUTH → HOME ───────────────────────────────────────
-        if page in ("landing", "login", "register", "register_pro", "forgot_password"):
+        
+        # Redireciona páginas de auth para home se já estiver logado
+        auth_pages = {"landing", "login", "register", "register_pro", "forgot_password"}
+        if page in auth_pages:
             st.session_state.page = "home"
             st.rerun()
-
-        # ── PREFERÊNCIAS DE NOTIFICAÇÃO NO PERFIL ─────────────────────────
-        # (verificação de trial expirando via banner na sidebar)
-
-        # ── SIDEBAR + CONTEÚDO ────────────────────────────────────────────
-        sidebar_view.render(services)
-
-        view = PATIENT_ROUTES.get(page)
-        if view:
-            view.render(services, user)
+        
+        # Renderiza Sidebar e Banner de Trial
+        views["sidebar"](services)
+        
+        if page not in {"onboarding", "profile"}:
+            services["plan"].trial_banner(user)
+        
+        # Renderiza a view do paciente
+        view_fn = views.get(page)
+        if view_fn:
+            view_fn(services, user)
         else:
-            logger.warning(f"Página desconhecida: {page}")
+            logger.warning(f"Página desconhecida ou não mapeada: {page}")
             st.session_state.page = "home"
             st.rerun()
-
+            
     except Exception as e:
-        logger.error(f"Erro crítico em main(): {e}", exc_info=True)
-        st.error(
-            "⚠️ Ocorreu um erro inesperado. Por favor, recarregue a página. "
-            "Se o problema persistir, entre em contato: suporte@melshape.com.br"
-        )
-        if st.button("🔄 Recarregar"):
-            st.rerun()
+        logger.error(f"Erro crítico no roteamento: {e}", exc_info=True)
+        _render_error_page(e)
 
+def _render_error_page(error: Exception) -> None:
+    """Renderiza página de erro amigável (Graceful Degradation)."""
+    st.markdown(
+        f"""
+        <div style="text-align:center;padding:4rem 2rem;">
+            <div style="font-size:4rem;">🔥</div>
+            <h1 style="font-family:var(--font-display);color:var(--text);">
+                Algo deu errado
+            </h1>
+            <p style="color:var(--text-muted);max-width:500px;margin:1rem auto;">
+                O Melshape encontrou um problema inesperado. 
+                Nossa equipe já foi notificada.
+            </p>
+            <div style="background:var(--surface-2);border-radius:var(--radius-md);
+                 padding:1rem;margin:1rem auto;max-width:600px;text-align:left;
+                 font-size:0.82rem;color:var(--text-muted);">
+                <strong>Erro:</strong> {str(error)[:200]}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    if st.button("🔄 Tentar novamente", type="primary", use_container_width=True):
+        st.rerun()
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def main() -> None:
+    """Ponto de entrada principal da aplicação."""
+    # 1. Inicializa estado da sessão
+    _init_session_state()
+    
+    # 2. Carrega CSS e aplica tema
+    if css := _load_css():
+        st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+    
+    if st.session_state.user and st.session_state.user.get("dark_mode"):
+        _apply_theme(True)
+    
+    # 3. Inicializa serviços (sem usar variáveis globais)
+    services = _init_services()
+    
+    # 4. Roteia a requisição
+    _route(services)
 
 if __name__ == "__main__":
     main()
