@@ -592,6 +592,8 @@ class AppInitializer:
     @staticmethod
     def setup_page_config() -> None:
         """Configura a página Streamlit."""
+        # Corrige os URLs dos menu_items para usar mailto:
+        support_mailto = f"mailto:{config.SUPPORT_EMAIL}"
         st.set_page_config(
             page_title=f"{config.APP_NAME} — {config.APP_TAGLINE}",
             page_icon=config.APP_ICON,
@@ -599,8 +601,8 @@ class AppInitializer:
             initial_sidebar_state="expanded",
             menu_items={
                 "About": f"{config.APP_NAME} v{config.APP_VERSION} · {config.APP_TAGLINE}",
-                "Report a bug": config.SUPPORT_EMAIL,
-                "Get help": config.SUPPORT_EMAIL,
+                "Report a bug": support_mailto,
+                "Get help": support_mailto,
             },
         )
     
