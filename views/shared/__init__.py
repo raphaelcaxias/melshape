@@ -1,13 +1,17 @@
 """
-views.shared — Alias para o pacote ``shared``.
+views.shared — Alias para o pacote ``shared`` (elementos compartilhados).
+
+Módulos disponíveis
+-------------------
+sidebar         Sidebar de navegação (render)
+sidebar_nav     Lógica de itens de menu e navegação
 """
 
 import sys
 import importlib
 
-# Força a importação do módulo shared real, independente de onde esteja
+# Tenta importar o módulo shared real
 try:
-    # Tenta importar o módulo shared (que fica na raiz)
     _real = importlib.import_module("shared")
     sys.modules["views.shared"] = _real
 except ImportError:
@@ -19,7 +23,6 @@ except ImportError:
 
 # Agora, tenta importar a função render do arquivo sidebar dentro do módulo shared
 try:
-    # Se o módulo shared existe, importa sidebar.render
     from shared.sidebar import render as sidebar
 except ImportError:
     # Se o arquivo shared/sidebar.py não existe, define uma função placeholder
