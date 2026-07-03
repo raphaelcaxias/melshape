@@ -1,35 +1,32 @@
 """
-views.professional — Alias para o pacote ``professional`` (telas do profissional).
-
-Este módulo é um proxy: qualquer import de ``views.professional.X``
-resolve para ``professional.X``.
+views.shared — Alias para o pacote ``shared`` (elementos compartilhados).
 
 Módulos disponíveis
 -------------------
-dashboard_pro           Dashboard com lista de pacientes         (render)
-patient_detail          Detalhamento do paciente                 (render)
-executive_dashboard     Painel executivo da clínica              (render)
-triage_panel            Triagem e alertas clínicos               (render_triagem)
-consultation_summary_view Resumo de consulta por IA             (render)
-
-Módulos auxiliares
-------------------
-dashboard_pro_tabs      Tabs do dashboard
-patient_detail_charts   Gráficos do paciente
-patient_detail_tabs     Tabs do paciente
-patient_actions         Ações rápidas
-patient_prescription    Prescrições e condutas
+sidebar         Sidebar de navegação (render)
+sidebar_nav     Lógica de itens de menu e navegação
 """
 
 import sys
 import importlib
 
-_real = importlib.import_module("professional")
-sys.modules.setdefault("views.professional", _real)
+# Tenta importar o módulo shared real
+try:
+    _real = importlib.import_module("shared")
+    sys.modules.setdefault("views.shared", _real)
+except ImportError:
+    # Fallback: cria um módulo shared vazio para evitar erro
+    import types
+    _real = types.ModuleType("shared")
+    sys.modules["shared"] = _real
+    sys.modules["views.shared"] = _real
 
-from professional import dashboard_pro, patient_detail  # noqa: E402
+# Importa a função render do módulo sidebar e a expõe como 'sidebar'
+try:
+    from shared.sidebar import render as sidebar
+except ImportError:
+    # Fallback: define uma função placeholder
+    def sidebar(*args, **kwargs):
+        pass
 
-__all__ = [
-    "dashboard_pro",
-    "patient_detail",
-]
+__all__ = ["sidebar"]
