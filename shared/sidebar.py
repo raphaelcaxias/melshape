@@ -1,8 +1,10 @@
 """
 Melshape — Sidebar do paciente.
+
 Menu: Jornada, Check-in, Registrar, Evolução, Conquistas + pilar + perfil.
 Dark mode com persistência no banco.
 """
+
 import streamlit as st
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
