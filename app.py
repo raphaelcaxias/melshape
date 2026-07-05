@@ -1,643 +1,714 @@
 """
-Melshape v3.0 — Entry Point Principal.
+Melshape — Versão de Teste Simplificada.
 
-Arquitetura limpa, roteamento declarativo, injeção de dependências,
-cache inteligente, tratamento de erros robusto e performance otimizada.
+Este é um app Streamlit mínimo e autossuficiente para testar a estrutura
+do projeto e verificar se o ambiente Streamlit Cloud está funcionando.
 
-Arquitetura:
-    AppInitializer
-    ├── SessionManager (gerencia estado da sessão)
-    ├── ServiceRegistry (registra e cacheia serviços)
-    ├── ViewRegistry (lazy loading de views)
-    ├── ThemeManager (gerencia tema CSS/dark mode)
-    ├── DemoDataLoader (carrega dados demo sob demanda)
-    └── Router (roteamento com Strategy Pattern)
-        ├── AuthRouter
-        ├── ProfessionalRouter
-        └── PatientRouter
-
-Princípios:
-- Tudo que pode ser cacheado, é cacheado (@st.cache_resource/@st.cache_data)
-- Tudo que pode ser lazy-loaded, é lazy-loaded
-- Erros são tratados com gracefulness (nunca quebram a UI)
-- Estado é gerenciado centralizadamente
-- Dark mode persistente no banco
-- Demo data carregado sob demanda
-- Tipagem forte: Protocol, TypedDict, dataclasses
-- Validação: dados validados antes de processar
-- Logging: todas as operações críticas são logadas
+Não depende de módulos externos problemáticos.
 """
-from __future__ import annotations
-
-import logging
-from dataclasses import dataclass, field
-from datetime import date, timedelta
-from typing import Any, Callable, Protocol, TypedDict, runtime_checkable
-
 import streamlit as st
-
-import config
-from core.database import Database
-from services.contextualizer import ctx
-from services.food_service import FoodService
-from services.gamification_service import GamificationService
-from services.journey_service import JourneyService
-from services.notification_service import NotificationService
-from services.nutrition_service import NutritionService
-from services.orchestrator import Orchestrator
-from services.plan_service import PlanService
-from services.professional_service import ProfessionalService
-from services.relapse_service import RelapseService
-from services.score_service import ScoreService
+from datetime import datetime
+import random
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
+# CONFIGURAÇÃO DA PÁGINA
 # ─────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=config.LOG_LEVEL,
-    format=config.LOG_FORMAT,
-    handlers=[logging.StreamHandler()],
+st.set_page_config(
+    page_title="🔥 Melshape — Teste",
+    page_icon="🔥",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        "About": "Melshape v3.0 — Teste de Deploy",
+        "Report a bug": "mailto:suporte@melshape.com.br",
+        "Get help": "mailto:suporte@melshape.com.br",
+    },
 )
-logger = logging.getLogger("Melshape")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TIPOS
+# ESTILO CSS (resumido)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ServicesDict(TypedDict):
-    """Dicionário tipado de serviços."""
-    db: Database
-    nutrition: NutritionService
-    gamification: GamificationService
-    foods: FoodService
-    plan: PlanService
-    professional: ProfessionalService
-    journey: JourneyService
-    orchestrator: Orchestrator
-    notification: NotificationService
-    score: ScoreService
-    contextualizer: Any
-    relapse: RelapseService
-
-
-@runtime_checkable
-class ViewFunction(Protocol):
-    """Protocol para funções de view."""
-    def __call__(self, services: ServicesDict, *args: Any, **kwargs: Any) -> None: ...
-
-
-@dataclass(frozen=True)
-class AppState:
-    """Estado da aplicação (imutável)."""
-    user: dict[str, Any] | None
-    professional: dict[str, Any] | None
-    page: str
-    perfil_id: str | None
-    demo_loaded: bool
-    onboarding_step: int
-    onboarding_mode: str
-    dark_mode: bool
-    
-    @classmethod
-    def from_session(cls) -> AppState:
-        """Cria AppState a partir do session_state."""
-        return cls(
-            user=st.session_state.get("user"),
-            professional=st.session_state.get("professional"),
-            page=st.session_state.get("page", "landing"),
-            perfil_id=st.session_state.get("perfil_id"),
-            demo_loaded=st.session_state.get("demo_loaded", False),
-            onboarding_step=st.session_state.get("onboarding_step", 1),
-            onboarding_mode=st.session_state.get("onboarding_mode", "general"),
-            dark_mode=st.session_state.get("dark_mode", False),
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTES
-# ─────────────────────────────────────────────────────────────────────────────
-
-_CACHE_TTL_SECONDS: int = 3600
-_AUTH_PAGES: frozenset[str] = frozenset({
-    "landing", "login", "register", "register_pro", "forgot_password"
-})
-_PRO_PAGES: frozenset[str] = frozenset({
-    "pro_dashboard", "pro_patient_detail", "pro_triagem", "pro_executive"
-})
-_PATIENT_PAGES: frozenset[str] = frozenset({
-    "home", "dashboard", "onboarding", "checkin", "meals", "weight",
-    "journey", "habits", "supplements", "workout", "goals", "analysis",
-    "glp1", "bariatric", "story", "profile", "evolution", "share"
-})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SESSION MANAGER
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SessionManager:
-    """Gerencia o estado da sessão de forma centralizada."""
-    
-    _DEFAULTS: dict[str, Any] = {
-        "user": None,
-        "professional": None,
-        "page": "landing",
-        "perfil_id": None,
-        "demo_loaded": False,
-        "onboarding_step": 1,
-        "onboarding_mode": "general",
-        "pro_selected_patient": None,
-        "reset_email_sent": False,
-        "hub_tipo": "meal",
-        "ci_result": None,
-        "cs_resumo": None,
-        "dark_mode": False,
-    }
-    
-    @staticmethod
-    def initialize() -> None:
-        """Inicializa o estado da sessão com valores padrão."""
-        for key, val in SessionManager._DEFAULTS.items():
-            if key not in st.session_state:
-                st.session_state[key] = val
-        
-        # Mutáveis precisam de atenção especial
-        if "desafios_concluidos_local" not in st.session_state:
-            st.session_state["desafios_concluidos_local"] = set()
-    
-    @staticmethod
-    def get_state() -> AppState:
-        """Retorna estado atual da aplicação."""
-        return AppState.from_session()
-    
-    @staticmethod
-    def update_page(page: str) -> None:
-        """Atualiza página atual."""
-        st.session_state.page = page
-    
-    @staticmethod
-    def is_authenticated() -> bool:
-        """Verifica se usuário está autenticado."""
-        return st.session_state.user is not None
-    
-    @staticmethod
-    def is_professional() -> bool:
-        """Verifica se é profissional."""
-        return st.session_state.professional is not None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SERVICE REGISTRY
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ServiceRegistry:
-    """Registra e cacheia serviços com injeção de dependências."""
-    
-    @staticmethod
-    @st.cache_resource(show_spinner=False, ttl=_CACHE_TTL_SECONDS)
-    def initialize() -> ServicesDict:
-        """
-        Inicializa todos os serviços com cache de recurso.
-        Mantém as instâncias vivas entre os reruns do Streamlit.
-        """
-        logger.info(f"🚀 Inicializando {config.APP_NAME} v{config.APP_VERSION}...")
-        
-        db = Database()
-        supabase_client = db.client if db.is_real else None
-        
-        services: ServicesDict = {
-            "db": db,
-            "nutrition": NutritionService(db),
-            "gamification": GamificationService(db),
-            "foods": FoodService(supabase_client),
-            "plan": PlanService(db),
-            "professional": ProfessionalService(db),
-            "journey": JourneyService(db),
-            "orchestrator": Orchestrator(db),
-            "notification": NotificationService(db),
-            "score": ScoreService(db),
-            "contextualizer": ctx,
-            "relapse": RelapseService(db),
+st.markdown(
+    """
+    <style>
+        /* Reset e base */
+        .main {
+            background: #F7F5F2;
         }
-        
-        # Inicia agendador de notificações em background
-        ServiceRegistry._start_notification_scheduler(db)
-        
-        return services
-    
-    @staticmethod
-    def _start_notification_scheduler(db: Database) -> None:
-        """Inicia agendador de notificações com tratamento de erros."""
-        try:
-            from services.notification_service import schedule_daily_reminders
-            schedule_daily_reminders(db)
-            logger.info("✅ Agendador de notificações iniciado")
-        except Exception as e:
-            logger.warning(f"⚠️ Agendador não iniciado: {e}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VIEW REGISTRY
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ViewRegistry:
-    """Lazy loading e cache de views."""
-    
-    @staticmethod
-    @st.cache_data(show_spinner=False, ttl=_CACHE_TTL_SECONDS)
-    def get_views() -> dict[str, ViewFunction]:
-        """
-        Carrega e cacheia o dicionário de views.
-        Imports locais para evitar circular imports e carregar sob demanda.
-        """
-        # Auth
-        from views.auth import forgot_password, landing, login, register
-        
-        # Shared
-        from views.shared import sidebar
-        
-        # Patient
-        from views.patient import (
-            bariatric,
-            checkin,
-            glp1,
-            goals,
-            habits,
-            home,
-            journey_story,
-            onboarding,
-            profile,
-        )
-        from views.patient import achievements
-        from views.patient.complete_evolution import render as evolution_view
-        from views.patient.journey import render as journey_view
-        from views.patient.register_hub import render as register_hub_view
-        from views.patient.share_card import render as share_view
-        
-        # Professional
-        from views.professional import dashboard_pro, patient_detail
-        from views.professional.executive_dashboard import render as executive_view
-        from views.professional.triage_panel import render_triagem
-        from patient.score_view import render as score_view
-        from patient.prescricoes_view import render as prescricoes_view
-        from patient.evolucao_visual import render as evolucao_visual
-        from professional.onboarding_pro import render as pro_onboarding_view
-        from professional.patients_list import render as pro_pacientes_view
-        
-        return {
-            # Auth
-            "landing": landing.render,
-            "login": login.render,
-            "register": register.render,
-            "register_pro": register.render,
-            "forgot_password": forgot_password.render,
-            # Patient
-            "home": home.render,
-            "dashboard": home.render,
-            "onboarding": onboarding.render,
-            "checkin": checkin.render,
-            "meals": register_hub_view,
-            "weight": register_hub_view,
-            "journey": journey_view,
-            "habits": habits.render,
-            "supplements": habits.render,
-            "workout": habits.render,
-            "goals": goals.render,
-            "analysis": achievements.render,
-            "glp1": glp1.render,
-            "bariatric": bariatric.render,
-            "story": journey_story.render,
-            "profile": profile.render,
-            "evolution": evolution_view,
-            "share": share_view,
-            # Professional
-            "pro_dashboard": dashboard_pro.render,
-            "pro_patient_detail": patient_detail.render,
-            "pro_triagem": render_triagem,
-            "pro_executive": executive_view,
-            "pro_convite": __import__("professional.patient_invite", fromlist=["render"]).render,
-            "score": score_view,
-            "prescricoes": prescricoes_view,
-            "evolucao_visual": evolucao_visual,
-            "pro_onboarding": pro_onboarding_view,
-            "pro_pacientes": pro_pacientes_view,
-            # Shared
-            "sidebar": sidebar.render,
+        h1, h2, h3 {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            color: #1A1814;
         }
-
+        .metric-card {
+            background: white;
+            border: 1px solid #DDD9D1;
+            border-radius: 10px;
+            padding: 1rem 1.1rem;
+            box-shadow: 0 1px 3px rgba(26,24,20,.06);
+            margin-bottom: 0.5rem;
+        }
+        .metric-value {
+            font-weight: 800;
+            font-size: 1.6rem;
+            color: #1A1814;
+        }
+        .metric-label {
+            font-size: 0.76rem;
+            color: #6B6560;
+            margin-top: 0.2rem;
+        }
+        .badge {
+            display: inline-block;
+            border-radius: 9999px;
+            padding: 0.2rem 0.65rem;
+            font-size: 0.72rem;
+            font-weight: 700;
+            background: #FBF4E0;
+            color: #B8922A;
+            border: 1px solid #E8D08A;
+        }
+        .alert-info {
+            background: #EFF6FF;
+            border-left: 3px solid #1D4ED8;
+            border-radius: 6px;
+            padding: 0.7rem 1rem;
+            margin: 0.5rem 0;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #C9A84C, #a8862e);
+            color: white;
+            border: none;
+            padding: 0.55rem 1.25rem;
+            border-radius: 8px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 14px rgba(184,146,42,.45);
+        }
+        .status-ok { color: #15803D; }
+        .status-error { color: #B91C1C; }
+        .status-warning { color: #B45309; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# THEME MANAGER
+# DADOS MOCK
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ThemeManager:
-    """Gerencia tema CSS e dark mode."""
-    
-    @staticmethod
-    @st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
-    def load_css() -> str:
-        """Carrega CSS do arquivo com cache."""
-        try:
-            with open("assets/style.css", encoding="utf-8") as f:
-                return f.read()
-        except FileNotFoundError:
-            logger.warning("assets/style.css não encontrado.")
-            return ""
-    
-    @staticmethod
-    def apply(dark_mode: bool) -> None:
-        """Aplica o tema (claro/escuro) via JavaScript."""
-        theme = "dark" if dark_mode else "light"
+MOCK_USER = {
+    "name": "Usuário Teste",
+    "email": "teste@melshape.com.br",
+    "health_mode": "general",
+    "current_weight": 78.5,
+    "goal_weight": 70.0,
+    "plan": "trial",
+    "dark_mode": False,
+}
+
+MOCK_STATS = {
+    "xp": 450,
+    "level": 3,
+    "level_name": "Determinado",
+    "streak": 7,
+    "badges": 4,
+}
+
+MOCK_DAILY = {
+    "calories": 1650,
+    "protein": 82.5,
+    "hydration": 1800,
+    "water_goal": 2000,
+    "meals_count": 3,
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR SIMPLIFICADA
+# ─────────────────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown(
+        """
+        <div style="padding: 1rem 0.5rem;">
+            <div style="font-size: 2rem;">🔥</div>
+            <div style="font-weight: 800; font-size: 1.25rem; color: #1A1814;">
+                Melshape
+            </div>
+            <div style="font-size: 0.72rem; color: #A09890; font-style: italic;">
+                Para quem está mudando de verdade.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # Informações do usuário
+    st.markdown(
+        f"""
+        <div style="padding: 0.2rem 0;">
+            <div style="font-weight: 700; font-size: 0.9rem; color: #1A1814;">
+                👤 {MOCK_USER['name']}
+            </div>
+            <span class="badge">⚖️ Emagrecimento</span>
+            <span class="badge" style="background:#E8F5E9;color:#15803D;border-color:#86EFAC;">
+                ⏳ TRIAL (7d)
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # Stats rápidos
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("🔥 Calorias", f"{MOCK_DAILY['calories']} kcal")
+    with col2:
+        st.metric("🥩 Proteína", f"{MOCK_DAILY['protein']:.0f}g")
+
+    st.markdown("---")
+
+    # Menu
+    pages = [
+        "🏠 Home",
+        "✅ Check-in",
+        "📊 Score",
+        "📋 Hábitos",
+        "➕ Registrar",
+        "🎯 Metas",
+        "🗺️ Jornada",
+        "🏆 Conquistas",
+        "👤 Perfil",
+    ]
+
+    for page in pages:
+        if st.button(page, use_container_width=True, key=f"menu_{page}"):
+            st.session_state.page = page
+            st.rerun()
+
+    st.markdown("---")
+
+    if st.button("🌙 Modo escuro", use_container_width=True):
+        st.session_state.dark_mode = not st.session_state.get("dark_mode", False)
+        st.rerun()
+
+    if st.button("🚪 Sair", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTEÚDO PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_home():
+    """Renderiza a página inicial."""
+    st.markdown(
+        f"""
+        <div style="margin-bottom: 1rem;">
+            <h1 style="font-size: 1.7rem; margin: 0;">
+                Olá, {MOCK_USER['name']} 👋
+            </h1>
+            <p style="color: #6B6560; margin: 0.2rem 0 0;">
+                {datetime.now().strftime('%A, %d de %B de %Y')}
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Card de streak
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <div class="metric-value" style="font-size: 2.5rem;">
+                        {MOCK_STATS['streak']}
+                    </div>
+                    <div class="metric-label">🔥 Dias consecutivos</div>
+                </div>
+                <div style="text-align: right;">
+                    <div style="font-size: 1.2rem;">✅ Check-in feito!</div>
+                    <div style="font-size: 0.76rem; color: #6B6560;">
+                        Últimos 7 dias: 🟢🟢🟢🟢🟢🟢🟢
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Próximo passo
+    st.markdown(
+        """
+        <div class="alert-info">
+            <b>💡 Próximo passo:</b> Registre suas refeições de hoje
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Métricas principais
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
         st.markdown(
-            f'<script>document.documentElement.setAttribute("data-theme","{theme}")</script>',
+            f"""
+            <div class="metric-card">
+                <div class="metric-value">{MOCK_DAILY['calories']}</div>
+                <div class="metric-label">🔥 kcal</div>
+                <div style="font-size:0.72rem;color:#6B6560;">Meta: 1800 kcal</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col2:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-value">{MOCK_DAILY['protein']:.0f}g</div>
+                <div class="metric-label">🥩 Proteína</div>
+                <div style="font-size:0.72rem;color:#6B6560;">Meta: 100g</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col3:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-value">{MOCK_DAILY['hydration']}ml</div>
+                <div class="metric-label">💧 Água</div>
+                <div style="font-size:0.72rem;color:#6B6560;">Meta: {MOCK_DAILY['water_goal']}ml</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col4:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-value">{MOCK_STATS['xp']}</div>
+                <div class="metric-label">⭐ XP Total</div>
+                <div style="font-size:0.72rem;color:#6B6560;">Nível {MOCK_STATS['level']}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Hábitos do dia
+    st.markdown("---")
+    st.markdown("### 📋 Hábitos de Hoje")
+
+    habits = [
+        ("💧", "Beber 2L de água", True),
+        ("🥩", "Atingir meta proteica", False),
+        ("🚶", "Caminhar 30 minutos", True),
+        ("😴", "Dormir 7-8 horas", False),
+    ]
+
+    for icon, name, done in habits:
+        status = "✅" if done else "⬜"
+        st.markdown(
+            f"""
+            <div style="display: flex; justify-content: space-between; align-items: center;
+                 padding: 0.5rem 0; border-bottom: 1px solid #EAE7E1;">
+                <span style="font-size: 0.9rem;">
+                    {icon} {name}
+                </span>
+                <span style="font-weight: 700; color: {'#15803D' if done else '#6B6560'};">
+                    {status}
+                </span>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DEMO DATA LOADER
-# ─────────────────────────────────────────────────────────────────────────────
-
-class DemoDataLoader:
-    """Carrega dados demo para o usuário demo sob demanda."""
-    
-    _DEMO_MEALS: tuple[tuple[str, int, float, float, float, float, str, int, str], ...] = (
-        ("Peito de Frango Grelhado", 318, 64, 0, 7, 0, "12:30", 0, "almoco"),
-        ("Arroz Integral Cozido", 248, 5.6, 52, 1.6, 3.4, "12:35", 0, "almoco"),
-        ("Café com Leite", 120, 6, 12, 4, 0, "07:30", 0, "cafe_manha"),
-        ("Proteína Whey", 120, 24, 3, 2, 0, "18:00", 0, "pre_pos_treino"),
-        ("Banana Prata", 98, 1.3, 26, 0.1, 2, "15:30", 1, "lanche"),
-        ("Tilápia Assada", 256, 52, 0, 5.4, 0, "12:30", 1, "almoco"),
-        ("Aveia em Flocos", 360, 13, 64, 6.9, 9.4, "08:00", 2, "cafe_manha"),
+def render_checkin():
+    """Renderiza a página de check-in."""
+    st.markdown(
+        """
+        <h1>✅ Check-in Diário</h1>
+        <p style="color: #6B6560;">Como você está hoje? Leva menos de 30 segundos.</p>
+        """,
+        unsafe_allow_html=True,
     )
-    
-    @staticmethod
-    def load_if_needed(services: ServicesDict) -> None:
-        """Carrega dados demo se necessário."""
-        state = SessionManager.get_state()
-        
-        if state.demo_loaded:
-            return
-        
-        if not state.user or state.user.get("email") != config.DEMO_EMAIL:
-            return
-        
-        db = services["db"]
-        
-        # Verificação rápida para não inserir dados duplicados
-        if len(db.get_meals(30)) > 0:
-            st.session_state.demo_loaded = True
-            return
-        
-        try:
-            DemoDataLoader._insert_demo_data(db)
-            st.session_state.demo_loaded = True
-            logger.info("✅ Demo data carregado com sucesso")
-        except Exception as e:
-            logger.warning(f"Erro ao carregar demo data: {e}")
-    
-    @staticmethod
-    def _insert_demo_data(db: Database) -> None:
-        """Insere dados demo no banco."""
-        from core.models import Meal, WeightLog
-        
-        # Insere refeições demo
-        for food, cal, p, c, f, fi, t, d, tipo in DemoDataLoader._DEMO_MEALS:
-            db.save_meal(Meal(
-                food=food,
-                calories=cal,
-                protein=p,
-                carbs=c,
-                fat=f,
-                fiber=fi,
-                meal_time=t,
-                meal_type=tipo,
-                meal_date=(date.today() - timedelta(days=d)).isoformat(),
-            ))
-        
-        # Insere pesos demo (30 dias)
-        for i in range(30):
-            db.save_weight(WeightLog(
-                weight=round(82.0 - i * 0.14, 1),
-                log_date=(date.today() - timedelta(days=29 - i)).isoformat(),
-            ))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ROUTER (Strategy Pattern)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class Router:
-    """Roteamento principal com Strategy Pattern."""
-    
-    def __init__(self, services: ServicesDict) -> None:
-        self.services = services
-        self.views = ViewRegistry.get_views()
-    
-    def route(self) -> None:
-        """Roteia a requisição com tratamento de erros."""
-        try:
-            self._handle_routing()
-        except Exception as e:
-            logger.error(f"Erro crítico no roteamento: {e}", exc_info=True)
-            self._render_error_page(e)
-    
-    def _handle_routing(self) -> None:
-        """Lógica de roteamento principal."""
-        state = SessionManager.get_state()
-        
-        # 1. RESET DE SENHA VIA URL (Prioridade máxima)
-        if self._is_password_reset_request():
-            self.views["forgot_password"](self.services)
-            return
-        
-        # 2. FLUXO DO PROFISSIONAL
-        if state.professional:
-            self._route_professional(state)
-            return
-        
-        # 3. FLUXO NÃO AUTENTICADO
-        if not state.user:
-            self._route_unauthenticated(state)
-            return
-        
-        # 4. FLUXO DO PACIENTE AUTENTICADO
-        self._route_authenticated_patient(state)
-    
-    def _is_password_reset_request(self) -> bool:
-        """Verifica se é requisição de reset de senha."""
-        return "reset_token" in st.query_params and "email" in st.query_params
-    
-    def _route_professional(self, state: AppState) -> None:
-        """Roteia fluxo do profissional."""
-        page = state.page
-        professional = state.professional
-
-        # Onboarding obrigatório no primeiro acesso (Sprint 3)
-        onboarding_done = (
-            professional.get("onboarding_done", False)
-            if isinstance(professional, dict)
-            else getattr(professional, "onboarding_done", False)
+    with st.form("checkin_form"):
+        st.select_slider(
+            "😊 Humor",
+            options=[1, 2, 3, 4, 5],
+            value=3,
+            key="checkin_humor",
         )
-        if not onboarding_done and page != "pro_convite":
-            self.views["pro_onboarding"](self.services, professional)
-            return
 
-        if page == "pro_patient_detail":
-            self.views["pro_patient_detail"](self.services, state.professional)
-        elif page == "pro_triagem":
-            self.views["pro_triagem"](self.services)
-        elif page == "pro_executive":
-            self.views["pro_executive"](self.services)
-        elif page == "pro_convite":
-            self.views["pro_convite"](self.services, state.professional)
-        elif page == "pro_pacientes":
-            self.views["pro_pacientes"](self.services, state.professional)
-        else:
-            self.views["pro_dashboard"](self.services, state.professional)
-    
-    def _route_unauthenticated(self, state: AppState) -> None:
-        """Roteia fluxo não autenticado."""
-        target_page = state.page if state.page in _AUTH_PAGES else "landing"
-        self.views[target_page](self.services)
-    
-    def _route_authenticated_patient(self, state: AppState) -> None:
-        """Roteia fluxo do paciente autenticado."""
-        # Carrega demo data se necessário
-        DemoDataLoader.load_if_needed(self.services)
+        st.select_slider(
+            "⚡ Energia",
+            options=[1, 2, 3, 4, 5],
+            value=3,
+            key="checkin_energia",
+        )
 
-        # Sprint 6: rastreamento de uso — page_view (falha silenciosa)
-        try:
-            from services.analytics_service import EventTracker
-            uid = state.user.get("email", "") if isinstance(state.user, dict) else getattr(state.user, "email", "")
-            EventTracker(self.services.get("db"), uid).page_view(state.page)
-        except Exception:
-            pass
+        st.select_slider(
+            "😴 Qualidade do sono",
+            options=[1, 2, 3, 4, 5],
+            value=3,
+            key="checkin_sono",
+        )
 
-        # Onboarding obrigatório
-        if not state.user.get("onboarding_done") or state.page == "onboarding":
-            self._handle_onboarding(state)
-            return
+        st.text_input(
+            "💬 Algo que quer registrar?",
+            placeholder="Ex: Dormi bem, estou motivado...",
+            key="checkin_obs",
+        )
 
-        # Redireciona páginas de auth para home se já estiver logado
-        if state.page in _AUTH_PAGES:
-            SessionManager.update_page("home")
+        if st.form_submit_button(
+            "✅ Fazer check-in",
+            type="primary",
+            use_container_width=True,
+        ):
+            st.toast("✅ Check-in realizado com sucesso! +20 XP", icon="🔥")
+            st.balloons()
+
+
+def render_habits():
+    """Renderiza a página de hábitos."""
+    st.markdown(
+        """
+        <h1>📋 Hábitos</h1>
+        <p style="color: #6B6560;">Pequenas ações diárias que geram transformação.</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Estatísticas
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("📋 Hábitos hoje", "3/5")
+    with col2:
+        st.metric("📊 Aderência (7d)", "78%")
+    with col3:
+        st.metric("🔥 Melhor streak", "12 dias")
+
+    st.markdown("---")
+
+    # Lista de hábitos
+    habits = [
+        {"icon": "💧", "name": "Beber 2L de água", "streak": 7, "done": True},
+        {"icon": "🥩", "name": "Atingir meta proteica", "streak": 3, "done": False},
+        {"icon": "🚶", "name": "Caminhar 30 minutos", "streak": 5, "done": True},
+        {"icon": "😴", "name": "Dormir 7-8 horas", "streak": 2, "done": False},
+        {"icon": "✅", "name": "Registrar refeições", "streak": 4, "done": True},
+    ]
+
+    for habit in habits:
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col1:
+            st.markdown(
+                f"""
+                <div style="font-weight: 600; color: #1A1814; font-size: 0.95rem;">
+                    {habit['icon']} {habit['name']}
+                </div>
+                <div style="font-size: 0.76rem; color: #6B6560;">
+                    🔥 {habit['streak']} dias
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col2:
+            if habit['done']:
+                st.markdown(
+                    """
+                    <div style="color: #15803D; font-weight: 700; text-align: center;">
+                        ✅ Concluído
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                if st.button("✓", key=f"hab_{habit['name']}"):
+                    st.toast(f"{habit['icon']} {habit['name']} — +15 XP", icon="✅")
+                    st.rerun()
+        with col3:
+            if not habit['done']:
+                st.markdown(
+                    """
+                    <div style="font-size: 0.76rem; color: #6B6560; text-align: center;">
+                        Pendente
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("---")
+
+    if st.button("➕ Criar novo hábito", type="primary", use_container_width=True):
+        st.info("📝 Funcionalidade em desenvolvimento")
+
+
+def render_register():
+    """Renderiza a página de registro."""
+    st.markdown(
+        """
+        <h1>➕ Registrar</h1>
+        <p style="color: #6B6560;">Escolha o que quer registrar hoje.</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        if st.button("🍽️ Refeição", use_container_width=True):
+            st.session_state.registro = "refeicao"
             st.rerun()
-        
-        # Renderiza UI do paciente
-        self._render_patient_ui(state)
-    
-    def _handle_onboarding(self, state: AppState) -> None:
-        """Gerencia fluxo de onboarding."""
-        self.views["onboarding"](self.services, state.user)
-        
-        # Se acabou de completar o onboarding durante este rerun
-        if st.session_state.get("user", {}).get("onboarding_done"):
-            pass  # agendador ja iniciado em ServiceRegistry.initialize()
-    
-    def _render_patient_ui(self, state: AppState) -> None:
-        """Renderiza UI do paciente."""
-        # Sidebar
-        self.views["sidebar"](self.services)
-        
-        # Banner de trial (exceto em onboarding/profile)
-        if state.page not in {"onboarding", "profile"}:
-            self.services["plan"].trial_banner(state.user)
-        
-        # View da página
-        view_fn = self.views.get(state.page)
-        if view_fn:
-            view_fn(self.services, state.user)
-        else:
-            logger.warning(f"Página desconhecida ou não mapeada: {state.page}")
-            SessionManager.update_page("home")
+
+    with col2:
+        if st.button("⚖️ Peso", use_container_width=True):
+            st.session_state.registro = "peso"
             st.rerun()
-    
-    def _render_error_page(self, error: Exception) -> None:
-        """Renderiza página de erro amigável (Graceful Degradation)."""
+
+    with col3:
+        if st.button("💧 Água", use_container_width=True):
+            st.session_state.registro = "agua"
+            st.rerun()
+
+    with col4:
+        if st.button("✅ Check-in", use_container_width=True):
+            st.session_state.registro = "checkin"
+            st.rerun()
+
+    st.markdown("---")
+
+    tipo = st.session_state.get("registro", "refeicao")
+
+    if tipo == "refeicao":
+        st.subheader("🍽️ Registrar Refeição")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            alimento = st.text_input("Alimento", placeholder="Ex: Frango Grelhado")
+            quantidade = st.number_input("Quantidade (g)", min_value=10, value=150, step=10)
+        with col2:
+            tipo_refeicao = st.selectbox(
+                "Tipo",
+                ["Café da Manhã", "Almoço", "Lanche", "Jantar", "Ceia"]
+            )
+            horario = st.time_input("Horário", value=datetime.now().time())
+
+        if st.button("✅ Registrar refeição", type="primary", use_container_width=True):
+            st.toast("🍽️ Refeição registrada! +5 XP", icon="✅")
+
+    elif tipo == "peso":
+        st.subheader("⚖️ Registrar Peso")
+
+        peso = st.number_input(
+            "Peso (kg)",
+            min_value=30.0,
+            max_value=300.0,
+            value=MOCK_USER['current_weight'],
+            step=0.1,
+        )
+
+        if st.button("✅ Registrar peso", type="primary", use_container_width=True):
+            st.toast(f"⚖️ {peso:.1f} kg registrado! +30 XP", icon="✅")
+
+    elif tipo == "agua":
+        st.subheader("💧 Registrar Água")
+
+        ml = st.number_input("Quantidade (ml)", min_value=50, max_value=1000, value=200, step=50)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💧 Adicionar", type="primary", use_container_width=True):
+                st.toast(f"💧 {ml}ml de água registrado! +10 XP", icon="✅")
+
+        with col2:
+            total_hj = st.session_state.get("agua_total", 0) + ml
+            st.metric("Total hoje", f"{total_hj}ml", delta=f"{total_hj - 2000:.0f}ml da meta")
+
+    else:
+        st.subheader("✅ Check-in Rápido")
+
+        humor = st.select_slider("😊 Humor", options=[1, 2, 3, 4, 5], value=3)
+
+        if st.button("✅ Salvar check-in", type="primary", use_container_width=True):
+            st.toast("✅ Check-in salvo! +20 XP", icon="✅")
+
+
+def render_score():
+    """Renderiza a página de score."""
+    st.markdown(
+        """
+        <h1>📊 Seu Score de Transformação</h1>
+        <p style="color: #6B6560;">Uma visão completa de como você está evoluindo.</p>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    score = 68
+    level = "📈 Progresso Consistente"
+
+    st.markdown(
+        f"""
+        <div class="metric-card" style="text-align: center; padding: 1.5rem;">
+            <div style="font-size: 2.5rem;">{level.split()[0]}</div>
+            <div style="font-family: 'Segoe UI', sans-serif; font-weight: 800;
+                 font-size: 2.2rem; color: #B8922A;">
+                {score}
+            </div>
+            <div style="font-size: 0.76rem; color: #6B6560;">de 100 pontos</div>
+            <div style="font-size: 0.88rem; color: #B8922A; font-weight: 700; margin-top: 0.4rem;">
+                {level}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Dimensões
+    st.markdown("### As 5 dimensões da sua transformação")
+
+    dimensions = [
+        ("📅 Consistência", 72),
+        ("⚡ Engajamento", 65),
+        ("🍽️ Alimentação", 58),
+        ("😊 Bem-estar", 75),
+        ("📊 Indicadores", 45),
+    ]
+
+    for label, value in dimensions:
         st.markdown(
             f"""
-            <div style="text-align:center;padding:4rem 2rem;">
-                <div style="font-size:4rem;">🔥</div>
-                <h1 style="font-family:var(--font-display);color:var(--text);">
-                    Algo deu errado
-                </h1>
-                <p style="color:var(--text-muted);max-width:500px;margin:1rem auto;">
-                    O Melshape encontrou um problema inesperado. 
-                    Nossa equipe já foi notificada.
-                </p>
-                <div style="background:var(--surface-2);border-radius:var(--radius-md);
-                     padding:1rem;margin:1rem auto;max-width:600px;text-align:left;
-                     font-size:0.82rem;color:var(--text-muted);">
-                    <strong>Erro:</strong> {str(error)[:200]}
+            <div style="margin-bottom: 0.5rem;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 0.2rem;">
+                    <span style="font-size: 0.85rem;">{label}</span>
+                    <span style="font-weight: 700; color: {'#15803D' if value >= 60 else '#B45309' if value >= 40 else '#B91C1C'};">
+                        {value}%
+                    </span>
+                </div>
+                <div style="background: #F0EDE8; border-radius: 4px; height: 8px; overflow: hidden;">
+                    <div style="background: {'#15803D' if value >= 60 else '#B8922A' if value >= 40 else '#B91C1C'}; 
+                         height: 100%; width: {value}%; border-radius: 4px;"></div>
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        
-        if st.button("🔄 Tentar novamente", type="primary", use_container_width=True):
-            st.rerun()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# APP INITIALIZER
-# ─────────────────────────────────────────────────────────────────────────────
+def render_profile():
+    """Renderiza a página de perfil."""
+    st.markdown(
+        """
+        <h1>👤 Perfil</h1>
+        <p style="color: #6B6560;">Seus dados e configurações.</p>
+        """,
+        unsafe_allow_html=True,
+    )
 
-class AppInitializer:
-    """Inicializa a aplicação com todas as dependências."""
-    
-    @staticmethod
-    def setup_page_config() -> None:
-        """Configura a página Streamlit."""
-        # Corrige os URLs dos menu_items para usar mailto:
-        support_mailto = f"mailto:{config.SUPPORT_EMAIL}"
-        st.set_page_config(
-            page_title=f"{config.APP_NAME} — {config.APP_TAGLINE}",
-            page_icon=config.APP_ICON,
-            layout="wide",
-            initial_sidebar_state="expanded",
-            menu_items={
-                "About": f"{config.APP_NAME} v{config.APP_VERSION} · {config.APP_TAGLINE}",
-                "Report a bug": support_mailto,
-                "Get help": support_mailto,
-            },
+    tab1, tab2, tab3 = st.tabs(["👤 Dados", "💳 Plano", "⚙️ Preferências"])
+
+    with tab1:
+        st.markdown("##### 👤 Dados Pessoais")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.text_input("Nome", value=MOCK_USER['name'])
+            st.number_input("Peso atual (kg)", value=MOCK_USER['current_weight'])
+            st.number_input("Altura (cm)", value=170)
+
+        with col2:
+            st.text_input("Email", value=MOCK_USER['email'], disabled=True)
+            st.number_input("Peso desejado (kg)", value=MOCK_USER['goal_weight'])
+            st.selectbox("Gênero", ["Feminino", "Masculino", "Outro"])
+
+        st.selectbox(
+            "Modo de saúde",
+            ["⚖️ Emagrecimento", "💪 Fitness", "🔪 Pós-Bariátrica", "💉 GLP-1"],
         )
-    
-    @staticmethod
-    def apply_theme() -> None:
-        """Aplica tema CSS e dark mode."""
-        if css := ThemeManager.load_css():
-            st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
-        
-        state = SessionManager.get_state()
-        if state.user and state.dark_mode:
-            ThemeManager.apply(dark_mode=True)
+
+        if st.button("💾 Salvar dados", type="primary", use_container_width=True):
+            st.toast("💾 Dados salvos!", icon="✅")
+
+    with tab2:
+        st.markdown("##### 💳 Meu Plano")
+
+        st.markdown(
+            """
+            <div class="metric-card">
+                <div style="display: flex; align-items: center; gap: 0.8rem;">
+                    <span style="font-size: 2rem;">✨</span>
+                    <div>
+                        <div style="font-weight: 800; font-size: 1.1rem; color: #1A1814;">
+                            Trial
+                        </div>
+                        <div style="font-size: 0.80rem; color: #6B6560;">
+                            10 dias de acesso completo
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.progress(0.3, text="⏳ 7 dias restantes")
+
+        if st.button("🚀 Assinar Pro", type="primary", use_container_width=True):
+            st.info("🔜 Pagamento em breve")
+
+    with tab3:
+        st.markdown("##### ⚙️ Preferências")
+
+        dark_mode = st.toggle("🌙 Modo escuro", value=False)
+
+        st.markdown("##### 📧 Notificações")
+        st.checkbox("📬 Lembretes por email", value=True)
+        st.checkbox("🔥 Alertas de streak", value=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN
+# ROTEAMENTO
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    """Ponto de entrada principal da aplicação."""
-    # 1. Configura página
-    AppInitializer.setup_page_config()
-    
-    # 2. Inicializa estado da sessão
-    SessionManager.initialize()
-    
-    # 3. Aplica tema
-    AppInitializer.apply_theme()
-    
-    # 4. Inicializa serviços
-    services = ServiceRegistry.initialize()
-    
-    # 5. Roteia a requisição
-    router = Router(services)
-    router.route()
+def main():
+    """Função principal."""
+    # Inicializa estado da sessão
+    if "page" not in st.session_state:
+        st.session_state.page = "🏠 Home"
+
+    # Renderiza página selecionada
+    page = st.session_state.page
+
+    if page == "🏠 Home" or page == "home":
+        render_home()
+    elif page == "✅ Check-in" or page == "checkin":
+        render_checkin()
+    elif page == "📋 Hábitos" or page == "habits":
+        render_habits()
+    elif page == "➕ Registrar" or page == "meals":
+        render_register()
+    elif page == "📊 Score" or page == "score":
+        render_score()
+    elif page == "👤 Perfil" or page == "profile":
+        render_profile()
+    else:
+        render_home()
 
 
 if __name__ == "__main__":
